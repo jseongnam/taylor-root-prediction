@@ -1,0 +1,49 @@
+model:
+  type: transformer_interval_predictor
+  input:
+    representation: tokenized_ast
+    vocabulary:
+      - PAD
+      - UNK
+      - CLS
+      - x
+      - QM
+      - "+"
+      - "-"
+      - "*"
+      - "**"
+      - neg
+      - pos
+      - sin
+      - cos
+      - tan
+      - tanh
+      - sinh
+      - cosh
+      - exp
+      - log
+      - log10
+      - sqrt
+      - abs
+
+  architecture:
+    layers: 4
+    heads: 8
+    hidden_dim: 256
+    max_sequence_length: auto_top_1_percent_mean_x1_1
+
+  output:
+    type: interval_center
+    top_k: 25
+
+training:
+  dataset_size: 1000000
+  batch_size: 256
+  epochs: 20
+  learning_rate: 3.0e-4
+
+loss:
+  type: max_absolute_error
+  description: >
+    Maximum absolute difference between predicted interval center
+    and true root among predicted candidates.

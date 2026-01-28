@@ -1,0 +1,46 @@
+data:
+  domain:
+    x_range: [-1.0, 1.0]
+    shift_interval_width: 1.0
+
+  taylor:
+    order: 25
+    expansion: maclaurin
+    pad_to_order: true
+
+  functions:
+    base_transcendental:
+      - sin
+      - cos
+      - tan
+      - tanh
+      - sinh
+      - cosh
+      - exp
+      - ln_1px
+      - log10_1px
+      - sqrt
+      - abs
+
+    polynomial:
+      max_degree: 25
+      coeff_range: [-2.0, 2.0]
+
+  composition:
+    max_depth: 2
+    max_terms: 3
+    sampled_templates: 5000
+
+  parameter_sampling:
+    amplitude_a:
+      range: [-3.0, 3.0]
+      min_abs: 0.3
+    frequency_b:
+      sin_cos_exp: [-2.0, 2.0]
+      tan_tanh: [-0.6, 0.6]
+      log: [-0.4, 0.4]
+      min_abs: 0.05
+
+  normalization:
+    normalize_by_constant_term: true
+    constant_term_range: [-1.0, 1.0]

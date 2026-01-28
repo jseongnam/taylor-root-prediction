@@ -1,0 +1,12 @@
+baseline:
+  methods:
+    - newton_raphson
+    - bisection
+
+  initial_points:
+    count: 10
+    range: [-20.0, 20.0]
+
+  stopping_criteria:
+    residual_threshold: 1.0e-10
+    max_iterations: auto

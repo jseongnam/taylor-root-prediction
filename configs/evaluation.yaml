@@ -1,0 +1,15 @@
+evaluation:
+  success_condition:
+    residual_threshold: 1.0e-10
+    domain_constraint: true
+    derivative_threshold: 1.0e-10
+
+  metrics:
+    - absolute_residual
+    - relative_residual
+    - success_rate
+    - dominance_rate
+
+  hardware:
+    gpu: RTX_4070Ti
+    framework: pytorch
