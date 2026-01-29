@@ -1,37 +1,38 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-expr_center_ast_regression_len2_topk_es.py
+models/transformer/model.py
 
-- 입력: expr_str (수식 문자열)
-- 인코딩: Python AST 파싱 -> Prefix 토큰 시퀀스
-- 출력: K개의 구간(길이 2) 중심 후보 c_k (회귀)
-- 정답 판정(hit): min_{k} min_{j} |c_k - r_j| <= half_width
+✅ configs/transformer_interval.yaml 기반으로 동작하는 Transformer Interval Center Predictor
+- argparse/add_argument 없이 실행 가능
+- 입력: expr_str -> AST prefix 토큰 시퀀스(tokenized_ast)
+- 출력: top_k(=25) interval center 후보 (연속값)
+- loss.type = max_absolute_error:
+    dist_k = min_j |c_k - r_j|
+    loss_i = max_k dist_k
+    loss = mean_i loss_i
 
-Loss (multi-root + multi-candidate):
-  dist_i = min_k min_j |c_{i,k} - r_{i,j}|
-  margin_loss = mean( relu(dist_i - half_width)^2 )
-
-+ (선택) tie-break: 가장 가까운 후보를 nearest root로 약하게 끌어주는 MSE 항
-
-데이터셋:
-  {data_dir}/taylor_deg25_train.npz
-  {data_dir}/taylor_deg25_val.npz
-  {data_dir}/taylor_deg25_test.npz
-
-각 npz 키(필수):
-  - expr_str: object array (N,)
-  - roots:    float32 array (N,Kroot) with NaN padding
-
-핵심 옵션:
-  --auto-max-len : train set 토큰 길이의 p99 * 1.1로 max_len 자동 설정
-  --num-candidates : 출력 후보 개수 K
-  --patience : early stopping patience
+환경변수 override:
+  CFG_PATH=configs/transformer_interval.yaml
+  TRAIN_NPZ=/path/train.npz
+  VAL_NPZ=/path/val.npz
+  TEST_NPZ=/path/test.npz
+  OUT_DIR=runs/transformer_interval
+  DEVICE=cuda|cpu
+  MODE=train|eval     (기본 train)
 """
 
-import argparse
-import math
+from __future__ import annotations
+
+import os
 import re
 import ast
+import math
+import json
+import random
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -39,11 +40,106 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
+try:
+    import yaml  # PyYAML
+except Exception as e:
+    raise ImportError("PyYAML이 필요합니다. `pip install pyyaml`") from e
+
 
 # =========================
-# sanitize to Python-expr-friendly for AST
+# Seed
 # =========================
+def set_seed(seed: int = 1234) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
+
+# =========================
+# Config
+# =========================
+@dataclass
+class ModelCfg:
+    type: str
+    representation: str
+    vocab: List[str]
+    layers: int
+    heads: int
+    hidden_dim: int
+    max_sequence_length: str
+    output_type: str
+    top_k: int
+
+
+@dataclass
+class TrainCfg:
+    dataset_size: int
+    batch_size: int
+    epochs: int
+    learning_rate: float
+
+
+@dataclass
+class LossCfg:
+    type: str
+    description: str
+
+
+@dataclass
+class FullCfg:
+    model: ModelCfg
+    training: TrainCfg
+    loss: LossCfg
+
+
+def _get(d: Dict[str, Any], path: str, default=None):
+    cur = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def load_config(cfg_path: str) -> FullCfg:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    vocab = list(_get(raw, "model.input.vocabulary", []))
+    if not vocab:
+        raise ValueError("YAML에 model.input.vocabulary 가 비어있습니다.")
+
+    m = ModelCfg(
+        type=str(_get(raw, "model.type", "transformer_interval_predictor")),
+        representation=str(_get(raw, "model.input.representation", "tokenized_ast")),
+        vocab=vocab,
+        layers=int(_get(raw, "model.architecture.layers", 4)),
+        heads=int(_get(raw, "model.architecture.heads", 8)),
+        hidden_dim=int(_get(raw, "model.architecture.hidden_dim", 256)),
+        max_sequence_length=str(_get(raw, "model.architecture.max_sequence_length", "256")),
+        output_type=str(_get(raw, "model.output.type", "interval_center")),
+        top_k=int(_get(raw, "model.output.top_k", 25)),
+    )
+
+    t = TrainCfg(
+        dataset_size=int(_get(raw, "training.dataset_size", 0)),
+        batch_size=int(_get(raw, "training.batch_size", 256)),
+        epochs=int(_get(raw, "training.epochs", 20)),
+        learning_rate=float(_get(raw, "training.learning_rate", 3e-4)),
+    )
+
+    l = LossCfg(
+        type=str(_get(raw, "loss.type", "max_absolute_error")),
+        description=str(_get(raw, "loss.description", "")),
+    )
+
+    return FullCfg(model=m, training=t, loss=l)
+
+
+# =========================
+# Expr sanitize + AST -> Prefix tokens
+# =========================
 _ALLOWED_FUNCS = {
     "sin", "cos", "tan", "tanh", "sinh", "cosh",
     "exp", "log", "log10", "sqrt", "abs", "ln"
@@ -56,6 +152,7 @@ def sanitize_expr_for_ast(raw: str) -> str:
     elif "=0" in s:
         s = s.split("=0")[0].strip()
 
+    # 뒤에 "(...)" 같은 suffix 제거(원본 코드 유지)
     s = re.sub(r"\s*\([^()]*\)\s*$", "", s).strip()
     s = s.replace("^", "**")
     s = re.sub(r"\bnp\.", "", s)
@@ -63,35 +160,16 @@ def sanitize_expr_for_ast(raw: str) -> str:
     return s
 
 
-# =========================
-# AST -> Prefix tokens
-# =========================
+def ast_to_prefix_tokens(node: ast.AST, vocab_set: set) -> Tuple[List[str], List[float]]:
+    """
+    YAML vocab 기준으로 토큰을 생성.
+    숫자는 YAML에서 QM 토큰을 사용한다고 가정.
+    """
+    tokens: List[str] = []
+    nums: List[float] = []
 
-_BASE_TOKENS = [
-    "<PAD>", "<UNK>", "<CLS>",
-    "x", "NUM",
-    "+", "-", "*", "/", "**",
-    "neg", "pos",
-]
-_FUNC_TOKENS = sorted(list({
-    "sin","cos","tan","tanh","sinh","cosh","exp","log","log10","sqrt","abs"
-}))
-
-VOCAB = _BASE_TOKENS + _FUNC_TOKENS
-STOI = {t: i for i, t in enumerate(VOCAB)}
-PAD_ID = STOI["<PAD>"]
-UNK_ID = STOI["<UNK>"]
-CLS_ID = STOI["<CLS>"]
-NUM_ID = STOI["NUM"]
-
-def _tok_id(tok: str) -> int:
-    return STOI.get(tok, UNK_ID)
-
-def ast_to_prefix(node):
-    tokens = []
-    nums = []
-
-    def emit(tok, num=0.0):
+    def emit(tok: str, num: float = 0.0):
+        # vocab에 없으면 UNK로 매핑되지만, 토큰 자체는 유지해도 됨.
         tokens.append(tok)
         nums.append(float(num))
 
@@ -101,16 +179,16 @@ def ast_to_prefix(node):
 
         if isinstance(n, ast.Constant):
             if isinstance(n.value, (int, float)) and np.isfinite(float(n.value)):
-                emit("NUM", float(n.value))
+                emit("QM", float(n.value))  # number token
                 return
-            emit("<UNK>", 0.0)
+            emit("UNK", 0.0)
             return
 
         if isinstance(n, ast.Name):
             if n.id == "x":
                 emit("x", 0.0)
             else:
-                emit("<UNK>", 0.0)
+                emit("UNK", 0.0)
             return
 
         if isinstance(n, ast.UnaryOp):
@@ -119,7 +197,7 @@ def ast_to_prefix(node):
             elif isinstance(n.op, ast.UAdd):
                 emit("pos", 0.0)
             else:
-                emit("<UNK>", 0.0)
+                emit("UNK", 0.0)
             visit(n.operand)
             return
 
@@ -130,12 +208,11 @@ def ast_to_prefix(node):
                 emit("-", 0.0)
             elif isinstance(n.op, ast.Mult):
                 emit("*", 0.0)
-            elif isinstance(n.op, ast.Div):
-                emit("/", 0.0)
             elif isinstance(n.op, ast.Pow):
                 emit("**", 0.0)
             else:
-                emit("<UNK>", 0.0)
+                # YAML vocab에 "/"가 없으므로 Div 등은 UNK 처리
+                emit("UNK", 0.0)
             visit(n.left)
             visit(n.right)
             return
@@ -150,39 +227,45 @@ def ast_to_prefix(node):
             if fname == "ln":
                 fname = "log"
             if fname in _ALLOWED_FUNCS:
-                fname = "log" if fname == "ln" else fname
                 emit(fname, 0.0)
             else:
-                emit("<UNK>", 0.0)
+                emit("UNK", 0.0)
 
             if len(n.args) >= 1:
                 visit(n.args[0])
             else:
-                emit("<UNK>", 0.0)
+                emit("UNK", 0.0)
             return
 
-        emit("<UNK>", 0.0)
+        emit("UNK", 0.0)
 
     visit(node)
     return tokens, nums
 
-def encode_prefix(tokens, nums, max_len: int):
-    toks = ["<CLS>"] + tokens
+
+def encode_prefix(tokens: List[str], nums: List[float], max_len: int,
+                  stoi: Dict[str, int], pad_id: int, unk_id: int, cls_id: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    ids: (L,)
+    numvals: (L,)
+    attn: (L,)  (1=valid, 0=pad)
+    """
+    toks = ["CLS"] + tokens
     nvs = [0.0] + nums
 
     if len(toks) > max_len:
         toks = toks[:max_len]
         nvs = nvs[:max_len]
 
-    ids = np.array([_tok_id(t) for t in toks], dtype=np.int64)
+    ids = np.array([stoi.get(t, unk_id) for t in toks], dtype=np.int64)
     numvals = np.array(nvs, dtype=np.float32)
+    attn = np.ones((len(ids),), dtype=np.uint8)
 
-    attn = np.ones((len(ids),), dtype=np.bool_)
     if len(ids) < max_len:
         pad_n = max_len - len(ids)
-        ids = np.concatenate([ids, np.full((pad_n,), PAD_ID, dtype=np.int64)], axis=0)
+        ids = np.concatenate([ids, np.full((pad_n,), pad_id, dtype=np.int64)], axis=0)
         numvals = np.concatenate([numvals, np.zeros((pad_n,), dtype=np.float32)], axis=0)
-        attn = np.concatenate([attn, np.zeros((pad_n,), dtype=np.bool_)], axis=0)
+        attn = np.concatenate([attn, np.zeros((pad_n,), dtype=np.uint8)], axis=0)
 
     return ids, numvals, attn
 
@@ -190,12 +273,17 @@ def encode_prefix(tokens, nums, max_len: int):
 # =========================
 # Dataset
 # =========================
-
 class ExprCenterASTDataset(Dataset):
-    def __init__(self, expr_arr, roots_arr, max_len: int, sanitize: bool = True):
+    def __init__(self, expr_arr, roots_arr, max_len: int,
+                 stoi: Dict[str, int], pad_id: int, unk_id: int, cls_id: int,
+                 sanitize: bool = True):
         self.expr = expr_arr
         self.roots = roots_arr.astype(np.float64)
         self.max_len = int(max_len)
+        self.stoi = stoi
+        self.pad_id = int(pad_id)
+        self.unk_id = int(unk_id)
+        self.cls_id = int(cls_id)
         self.do_sanitize = bool(sanitize)
 
     def __len__(self):
@@ -208,35 +296,38 @@ class ExprCenterASTDataset(Dataset):
 
         try:
             node = ast.parse(e, mode="eval")
-            toks, nums = ast_to_prefix(node)
+            toks, nums = ast_to_prefix_tokens(node, vocab_set=set(self.stoi.keys()))
         except Exception:
-            toks, nums = ["<UNK>"], [0.0]
+            toks, nums = ["UNK"], [0.0]
 
-        ids, numvals, attn = encode_prefix(toks, nums, self.max_len)
+        ids, numvals, attn = encode_prefix(
+            toks, nums, self.max_len,
+            stoi=self.stoi, pad_id=self.pad_id, unk_id=self.unk_id, cls_id=self.cls_id
+        )
 
         r = self.roots[idx]
         mask = np.isfinite(r)
 
         return (
-            torch.from_numpy(ids),                         # (L,) int64
-            torch.from_numpy(numvals),                     # (L,) float32
-            torch.from_numpy(attn.astype(np.uint8)),       # (L,) uint8
-            torch.from_numpy(r),                           # (Kroot,) float64
-            torch.from_numpy(mask.astype(np.uint8)),       # (Kroot,) uint8
+            torch.from_numpy(ids),                    # (L,) int64
+            torch.from_numpy(numvals),                # (L,) float32
+            torch.from_numpy(attn),                   # (L,) uint8
+            torch.from_numpy(r),                      # (Kroot,) float64
+            torch.from_numpy(mask.astype(np.uint8)),  # (Kroot,) uint8
         )
 
 
 # =========================
 # Model
 # =========================
-
 class ASTPrefixTransformerTopK(nn.Module):
-    def __init__(self, vocab_size: int, max_len: int, num_candidates: int,
-                 d_model: int = 256, nhead: int = 8, num_layers: int = 4):
+    def __init__(self, vocab_size: int, max_len: int, top_k: int,
+                 d_model: int = 256, nhead: int = 8, num_layers: int = 4,
+                 num_token: str = "QM", stoi: Optional[Dict[str, int]] = None):
         super().__init__()
         self.max_len = int(max_len)
         self.d_model = int(d_model)
-        self.K = int(num_candidates)
+        self.K = int(top_k)
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_len, d_model)
@@ -250,8 +341,11 @@ class ASTPrefixTransformerTopK(nn.Module):
         enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
-        # cls -> K개의 y 출력
         self.y_head = nn.Linear(d_model, self.K)
+
+        self.num_id = None
+        if stoi is not None and num_token in stoi:
+            self.num_id = int(stoi[num_token])
 
     def forward(self, ids: torch.Tensor, numvals: torch.Tensor, attn_u8: torch.Tensor):
         B, L = ids.shape
@@ -259,22 +353,22 @@ class ASTPrefixTransformerTopK(nn.Module):
 
         x = self.tok_emb(ids) + self.pos_emb(pos)
 
-        is_num = (ids == NUM_ID).unsqueeze(-1)  # (B,L,1)
-        num_embed = self.num_mlp(numvals.unsqueeze(-1))  # (B,L,D)
-        x = x + num_embed * is_num
+        if self.num_id is not None:
+            is_num = (ids == self.num_id).unsqueeze(-1)  # (B,L,1)
+            num_embed = self.num_mlp(numvals.unsqueeze(-1))  # (B,L,D)
+            x = x + num_embed * is_num
 
         key_padding_mask = (attn_u8 == 0)  # True=ignore
         h = self.encoder(x, src_key_padding_mask=key_padding_mask)
 
-        cls = h[:, 0, :]            # (B,D)
-        y = self.y_head(cls)        # (B,K)
+        cls = h[:, 0, :]     # (B,D)
+        y = self.y_head(cls) # (B,K)
         return y
 
 
 # =========================
 # Dist / Loss / Metrics
 # =========================
-
 def min_dist_candidates_to_roots(cands: torch.Tensor, roots: torch.Tensor, mask: torch.Tensor):
     """
     cands: (B,Kcand) float64
@@ -282,39 +376,38 @@ def min_dist_candidates_to_roots(cands: torch.Tensor, roots: torch.Tensor, mask:
     mask:  (B,Kroot) bool
 
     return:
-      best_dist: (B,) float64  = min_k min_j |c_k - r_j|
-      best_k:    (B,) int64    = argmin over candidates
-      nearest_r: (B,) float64  = nearest root for that best candidate
+      min_over_k: (B,) float64  = min_k min_j |c_k - r_j|
+      max_over_k: (B,) float64  = max_k min_j |c_k - r_j|
+      best_k:     (B,) int64    = argmin over candidates
     """
-    # (B,Kcand,Kroot)
-    diff = torch.abs(cands.unsqueeze(-1) - roots.unsqueeze(1))
-
+    diff = torch.abs(cands.unsqueeze(-1) - roots.unsqueeze(1))  # (B,Kcand,Kroot)
     inf = torch.tensor(float("inf"), device=diff.device, dtype=diff.dtype)
     diff = torch.where(mask.unsqueeze(1), diff, inf)
 
-    # min over roots -> (B,Kcand)
-    min_over_roots, argmin_root = torch.min(diff, dim=-1)
+    # per candidate -> nearest root distance
+    min_over_roots, _ = torch.min(diff, dim=-1)  # (B,Kcand)
 
-    # min over candidates -> (B,)
-    best_dist, best_k = torch.min(min_over_roots, dim=1)
+    min_over_k, best_k = torch.min(min_over_roots, dim=1)      # (B,)
+    max_over_k, _      = torch.max(min_over_roots, dim=1)      # (B,)
+    return min_over_k, max_over_k, best_k
 
-    # nearest root index for chosen candidate
-    chosen_root_idx = argmin_root.gather(1, best_k.unsqueeze(1)).squeeze(1)  # (B,)
-    nearest = roots.gather(1, chosen_root_idx.unsqueeze(1)).squeeze(1)
 
-    return best_dist, best_k, nearest
+def loss_max_absolute_error(cands: torch.Tensor, roots: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    YAML 정의에 맞춘 loss:
+      dist_k = min_j |c_k - r_j|
+      loss_i = max_k dist_k
+    """
+    _, max_over_k, _ = min_dist_candidates_to_roots(cands, roots, mask)
+    return torch.mean(max_over_k)
 
-def margin_interval_loss_multiroot_topk(cands: torch.Tensor, roots: torch.Tensor, mask: torch.Tensor, half_width: float):
-    best_dist, _, _ = min_dist_candidates_to_roots(cands, roots, mask)
-    viol = torch.relu(best_dist - float(half_width))
-    return torch.mean(viol * viol)
 
 @torch.no_grad()
-def eval_metrics(model, loader, device, scale: float, half_width: float):
+def eval_metrics(model, loader, device, scale: float):
     model.eval()
-    hit = 0
     n = 0
-    all_err = []
+    mins = []
+    maxs = []
 
     for ids, numvals, attn_u8, roots, mask_u8 in loader:
         ids = ids.to(device)
@@ -324,47 +417,53 @@ def eval_metrics(model, loader, device, scale: float, half_width: float):
         roots = roots.to(device)
         mask = (mask_u8.to(device) > 0)
 
-        y = model(ids, numvals, attn_u8)                      # (B,K) float32
-        cands = (float(scale) * torch.sinh(y.double())).double()  # (B,K) float64
+        y = model(ids, numvals, attn_u8)                # (B,K) float32
+        cands = (float(scale) * torch.sinh(y.double())).double()
 
-        best_dist, _, _ = min_dist_candidates_to_roots(cands, roots, mask)
+        min_over_k, max_over_k, _ = min_dist_candidates_to_roots(cands, roots, mask)
 
-        ok = (best_dist <= float(half_width))
-        hit += int(ok.sum().item())
-        n += int(best_dist.numel())
+        m1 = min_over_k.detach().cpu().numpy()
+        m2 = max_over_k.detach().cpu().numpy()
+        m1 = m1[np.isfinite(m1)]
+        m2 = m2[np.isfinite(m2)]
+        if m1.size: mins.append(m1)
+        if m2.size: maxs.append(m2)
+        n += int(min_over_k.numel())
 
-        bd = best_dist.detach().cpu().numpy()
-        bd = bd[np.isfinite(bd)]
-        if bd.size:
-            all_err.append(bd)
+    if n == 0 or len(mins) == 0:
+        return {"min_mae": float("nan"), "min_p90": float("nan"), "min_p99": float("nan"),
+                "max_mae": float("nan"), "max_p90": float("nan"), "max_p99": float("nan"),
+                "n": int(n)}
 
-    if n == 0 or len(all_err) == 0:
-        return {"hit": float("nan"), "mae": float("nan"), "p90": float("nan"), "p99": float("nan"), "n": int(n)}
-
-    all_err = np.concatenate(all_err, axis=0)
+    mins = np.concatenate(mins, axis=0)
+    maxs = np.concatenate(maxs, axis=0)
     return {
-        "hit": hit / max(1, n),
-        "mae": float(all_err.mean()),
-        "p90": float(np.percentile(all_err, 90.0)),
-        "p99": float(np.percentile(all_err, 99.0)),
+        "min_mae": float(mins.mean()),
+        "min_p90": float(np.percentile(mins, 90.0)),
+        "min_p99": float(np.percentile(mins, 99.0)),
+        "max_mae": float(maxs.mean()),
+        "max_p90": float(np.percentile(maxs, 90.0)),
+        "max_p99": float(np.percentile(maxs, 99.0)),
         "n": int(n),
     }
 
 
 # =========================
-# Load data
+# Data utils
 # =========================
+def load_npz_expr_roots(npz_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    p = Path(npz_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Missing file: {p}")
+    data = np.load(p, allow_pickle=True)
+    if "expr_str" not in data:
+        raise KeyError(f"{p}에 expr_str 키가 없습니다. keys={list(data.keys())}")
+    if "roots" not in data:
+        raise KeyError(f"{p}에 roots 키가 없습니다. keys={list(data.keys())}")
+    return data["expr_str"], data["roots"]
 
-def load_split(data_dir: Path, split: str):
-    path = data_dir / f"taylor_deg25_{split}.npz"
-    if not path.exists():
-        raise FileNotFoundError(f"Missing split file: {path}")
-    data = np.load(path, allow_pickle=True)
-    expr = data["expr_str"]
-    roots = data["roots"]
-    return expr, roots
 
-def compute_scale_from_train_roots(roots_train: np.ndarray):
+def compute_scale_from_train_roots(roots_train: np.ndarray) -> float:
     r = np.asarray(roots_train, dtype=np.float64).reshape(-1)
     r = r[np.isfinite(r)]
     if r.size == 0:
@@ -372,7 +471,20 @@ def compute_scale_from_train_roots(roots_train: np.ndarray):
     scale = float(np.percentile(np.abs(r), 99.0))
     return max(scale, 1.0)
 
-def estimate_max_len_p99(expr_arr, sanitize: bool, mul: float = 1.1, p: float = 99.0, cap: int = 24):
+
+def estimate_len_from_train(expr_arr: np.ndarray, stoi: Dict[str, int], rule: str, sanitize: bool = True) -> int:
+    """
+    rule:
+      - "auto_top_1_percent_mean_x1_1" : (top 1% token lengths) mean * 1.1, ceil
+      - 숫자 문자열이면 그대로
+    """
+    if rule.isdigit():
+        return int(rule)
+
+    if rule != "auto_top_1_percent_mean_x1_1":
+        # fallback: p99*1.1 비슷하게
+        rule = "auto_top_1_percent_mean_x1_1"
+
     lens = []
     for e in expr_arr:
         s = str(e)
@@ -380,98 +492,126 @@ def estimate_max_len_p99(expr_arr, sanitize: bool, mul: float = 1.1, p: float = 
             s = sanitize_expr_for_ast(s)
         try:
             node = ast.parse(s, mode="eval")
-            toks, nums = ast_to_prefix(node)
+            toks, nums = ast_to_prefix_tokens(node, vocab_set=set(stoi.keys()))
             L = 1 + len(toks)  # +CLS
         except Exception:
             L = 2
         lens.append(L)
 
     lens = np.asarray(lens, dtype=np.float64)
-    p99 = float(np.percentile(lens, p))
-    max_len = int(math.ceil(p99 * float(mul)))
-    max_len = max(16, min(max_len, int(cap)))
-    return max_len, p99
+    if lens.size == 0:
+        return 64
+
+    # top 1% mean
+    q = np.percentile(lens, 99.0)
+    top = lens[lens >= q]
+    if top.size == 0:
+        top = lens
+    max_len = int(math.ceil(float(top.mean()) * 1.1))
+    max_len = max(16, min(max_len, 2048))
+    return max_len
 
 
 # =========================
-# Train with EarlyStopping
+# Train / Eval (no argparse)
 # =========================
+def train_from_yaml(
+    cfg_path: str,
+    train_npz: str,
+    val_npz: str,
+    test_npz: str,
+    out_dir: str,
+    device_str: str,
+) -> None:
+    cfg = load_config(cfg_path)
 
-def train(
-    data_dir: Path,
-    ckpt_path: Path,
-    num_candidates: int,
-    auto_max_len: bool,
-    max_len: int,
-    d_model: int,
-    nhead: int,
-    num_layers: int,
-    batch_size: int,
-    epochs: int,
-    lr: float,
-    device: str,
-    half_width: float,
-    tie_mse_weight: float,
-    sanitize_inputs: bool,
-    patience: int,
-    min_delta: float,
-    metric: str,  # "hit" or "mae"
-):
-    device = torch.device(device)
+    if cfg.loss.type != "max_absolute_error":
+        raise ValueError(f"현재 구현은 loss.type=max_absolute_error만 지원. got={cfg.loss.type}")
 
-    expr_tr, roots_tr = load_split(data_dir, "train")
-    expr_va, roots_va = load_split(data_dir, "val")
-    expr_te, roots_te = load_split(data_dir, "test")
+    # vocab build
+    vocab = cfg.model.vocab
+    stoi = {t: i for i, t in enumerate(vocab)}
+    if "PAD" not in stoi or "UNK" not in stoi or "CLS" not in stoi:
+        raise ValueError("YAML vocab에 PAD/UNK/CLS 토큰이 반드시 포함돼야 합니다.")
+    pad_id = stoi["PAD"]
+    unk_id = stoi["UNK"]
+    cls_id = stoi["CLS"]
 
-    if auto_max_len:
-        autoL, p99 = estimate_max_len_p99(expr_tr, sanitize=sanitize_inputs, mul=1.1, p=99.0, cap=2048)
-        print(f"[MAX_LEN] p99_len={p99:.1f} -> ceil(p99*1.1)={autoL}")
-        max_len = autoL
+    os.makedirs(out_dir, exist_ok=True)
+    set_seed(1234)
+    device = torch.device(device_str)
 
+    expr_tr, roots_tr = load_npz_expr_roots(train_npz)
+    expr_va, roots_va = load_npz_expr_roots(val_npz)
+    expr_te, roots_te = load_npz_expr_roots(test_npz)
+
+    # max_len auto
+    max_len_rule = cfg.model.max_sequence_length
+    max_len = estimate_len_from_train(expr_tr, stoi, max_len_rule, sanitize=True)
+
+    # scale
     scale = compute_scale_from_train_roots(roots_tr)
-    print(f"[SCALE] asinh/sinh scale = {scale:.6g} (p99(|roots_train|))")
-    print(f"[VOCAB] size={len(VOCAB)}  max_len={max_len}  K_candidates={num_candidates}")
 
-    ds_tr = ExprCenterASTDataset(expr_tr, roots_tr, max_len=max_len, sanitize=sanitize_inputs)
-    ds_va = ExprCenterASTDataset(expr_va, roots_va, max_len=max_len, sanitize=sanitize_inputs)
-    ds_te = ExprCenterASTDataset(expr_te, roots_te, max_len=max_len, sanitize=sanitize_inputs)
+    ds_tr = ExprCenterASTDataset(expr_tr, roots_tr, max_len=max_len, stoi=stoi, pad_id=pad_id, unk_id=unk_id, cls_id=cls_id, sanitize=True)
+    ds_va = ExprCenterASTDataset(expr_va, roots_va, max_len=max_len, stoi=stoi, pad_id=pad_id, unk_id=unk_id, cls_id=cls_id, sanitize=True)
+    ds_te = ExprCenterASTDataset(expr_te, roots_te, max_len=max_len, stoi=stoi, pad_id=pad_id, unk_id=unk_id, cls_id=cls_id, sanitize=True)
 
-    dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, num_workers=0)
-    dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=0)
-    dl_te = DataLoader(ds_te, batch_size=batch_size, shuffle=False, num_workers=0)
+    dl_tr = DataLoader(ds_tr, batch_size=cfg.training.batch_size, shuffle=True, num_workers=0)
+    dl_va = DataLoader(ds_va, batch_size=cfg.training.batch_size, shuffle=False, num_workers=0)
+    dl_te = DataLoader(ds_te, batch_size=cfg.training.batch_size, shuffle=False, num_workers=0)
 
     model = ASTPrefixTransformerTopK(
-        vocab_size=len(VOCAB),
+        vocab_size=len(vocab),
         max_len=max_len,
-        num_candidates=num_candidates,
-        d_model=d_model,
-        nhead=nhead,
-        num_layers=num_layers,
+        top_k=cfg.model.top_k,
+        d_model=cfg.model.hidden_dim,
+        nhead=cfg.model.heads,
+        num_layers=cfg.model.layers,
+        num_token="QM",
+        stoi=stoi,
     ).to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.training.learning_rate)
 
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_path = Path(out_dir) / "best.pt"
+    meta_path = Path(out_dir) / "meta.json"
 
-    # early stopping state
-    best_score = None
-    bad = 0
+    # save meta/config resolved
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "cfg_path": cfg_path,
+            "train_npz": train_npz,
+            "val_npz": val_npz,
+            "test_npz": test_npz,
+            "resolved": {
+                "vocab": vocab,
+                "vocab_size": len(vocab),
+                "max_len_rule": max_len_rule,
+                "max_len": int(max_len),
+                "top_k": int(cfg.model.top_k),
+                "layers": int(cfg.model.layers),
+                "heads": int(cfg.model.heads),
+                "hidden_dim": int(cfg.model.hidden_dim),
+                "scale": float(scale),
+                "loss_type": cfg.loss.type,
+            }
+        }, f, ensure_ascii=False, indent=2)
 
-    def is_better(new, best):
-        if best is None:
-            return True
-        if metric == "hit":
-            return new > (best + min_delta)
-        else:
-            # mae: smaller is better
-            return new < (best - min_delta)
+    print(f"[CFG]  {cfg_path}")
+    print(f"[DATA] train={len(ds_tr)} val={len(ds_va)} test={len(ds_te)}")
+    print(f"[VOCAB] size={len(vocab)}  max_len={max_len} (rule={max_len_rule})  top_k={cfg.model.top_k}")
+    print(f"[ARCH] layers={cfg.model.layers} heads={cfg.model.heads} hidden_dim={cfg.model.hidden_dim}")
+    print(f"[SCALE] asinh/sinh scale={scale:.6g}")
+    print(f"[OUT]  {out_dir}")
 
-    for ep in range(1, epochs + 1):
+    best_val = float("inf")
+
+    for ep in range(1, cfg.training.epochs + 1):
         model.train()
         loss_sum = 0.0
         n_sum = 0
 
-        pbar = tqdm(dl_tr, desc=f"train ep{ep}/{epochs}", ncols=120)
+        pbar = tqdm(dl_tr, desc=f"train ep{ep}/{cfg.training.epochs}", ncols=120)
         for ids, numvals, attn_u8, roots, mask_u8 in pbar:
             ids = ids.to(device)
             numvals = numvals.to(device)
@@ -481,20 +621,14 @@ def train(
             mask = (mask_u8.to(device) > 0)          # bool
 
             opt.zero_grad(set_to_none=True)
+
             y = model(ids, numvals, attn_u8)         # (B,Kcand) float32
-            cands = (scale * torch.sinh(y.double())).double()
+            cands = (float(scale) * torch.sinh(y.double())).double()
 
-            loss_margin = margin_interval_loss_multiroot_topk(
-                cands, roots, mask, half_width=half_width
-            )
+            loss = loss_max_absolute_error(cands, roots, mask)
 
-            if tie_mse_weight > 0:
-                best_dist, best_k, nearest = min_dist_candidates_to_roots(cands, roots, mask)
-                chosen_c = cands.gather(1, best_k.unsqueeze(1)).squeeze(1)
-                loss_tie = torch.mean((chosen_c - nearest) ** 2)
-                loss = loss_margin + float(tie_mse_weight) * loss_tie
-            else:
-                loss = loss_margin
+            if not torch.isfinite(loss):
+                continue
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -505,144 +639,131 @@ def train(
             n_sum += bs
             pbar.set_postfix(loss=f"{loss_sum/max(1,n_sum):.6f}")
 
-        va = eval_metrics(model, dl_va, device, scale=scale, half_width=half_width)
-        score = va["hit"] if metric == "hit" else va["mae"]
-        print(f"[VAL] ep={ep:03d}  hit={va['hit']:.4f}  mae={va['mae']:.4f}  p90={va['p90']:.4f}  n={va['n']}  score({metric})={score:.6g}")
+        va = eval_metrics(model, dl_va, device, scale=scale)
+        val_loss_proxy = va["max_mae"]  # max_abs_error 관점에서 max_mae를 proxy로 사용
+        print(
+            f"[VAL] ep={ep:03d} "
+            f"min_mae={va['min_mae']:.6g} min_p90={va['min_p90']:.6g} "
+            f"max_mae={va['max_mae']:.6g} max_p90={va['max_p90']:.6g} n={va['n']}"
+        )
 
-        if is_better(score, best_score):
-            best_score = score
-            bad = 0
+        # best 저장 기준: max_mae가 낮을수록 좋음
+        if np.isfinite(val_loss_proxy) and val_loss_proxy < best_val:
+            best_val = float(val_loss_proxy)
             torch.save(
                 {
                     "model_state": model.state_dict(),
-                    "config": {
-                        "vocab": VOCAB,
-                        "max_len": int(max_len),
-                        "num_candidates": int(num_candidates),
-                        "d_model": int(d_model),
-                        "nhead": int(nhead),
-                        "num_layers": int(num_layers),
-                        "scale": float(scale),
-                        "half_width": float(half_width),
-                        "tie_mse_weight": float(tie_mse_weight),
-                        "sanitize_inputs": bool(sanitize_inputs),
-                        "earlystop": {
-                            "patience": int(patience),
-                            "min_delta": float(min_delta),
-                            "metric": str(metric),
-                        }
-                    },
-                    "best_score": float(best_score),
+                    "scale": float(scale),
+                    "max_len": int(max_len),
+                    "vocab": vocab,
+                    "stoi": stoi,
+                    "best_val_max_mae": float(best_val),
+                    "cfg_path": cfg_path,
                 },
                 ckpt_path
             )
-            print(f"[SAVE] new best -> {ckpt_path} (best_{metric}={best_score:.6g})")
-        else:
-            bad += 1
-            if bad >= patience:
-                print(f"[EARLY STOP] no improvement for {patience} epochs. stop at ep={ep}.")
-                break
+            print(f"[SAVE] best -> {ckpt_path} (best_val_max_mae={best_val:.6g})")
 
     # test with best
-    obj = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(obj["model_state"])
-    scale_best = float(obj["config"]["scale"])
-    te = eval_metrics(model, dl_te, device, scale=scale_best, half_width=float(obj["config"]["half_width"]))
-    print(f"[TEST] hit={te['hit']:.4f}  mae={te['mae']:.4f}  p90={te['p90']:.4f}  p99={te['p99']:.4f}  n={te['n']}")
+    if ckpt_path.exists():
+        obj = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(obj["model_state"])
+        scale_best = float(obj["scale"])
+        te = eval_metrics(model, dl_te, device, scale=scale_best)
+        print(
+            f"[TEST] "
+            f"min_mae={te['min_mae']:.6g} min_p90={te['min_p90']:.6g} min_p99={te['min_p99']:.6g} | "
+            f"max_mae={te['max_mae']:.6g} max_p90={te['max_p90']:.6g} max_p99={te['max_p99']:.6g} | "
+            f"n={te['n']}"
+        )
+    print("[DONE]")
 
 
 @torch.no_grad()
-def run_eval(data_dir: Path, ckpt_path: Path, batch_size: int, device: str):
-    device = torch.device(device)
-    obj = torch.load(ckpt_path, map_location=device)
-    cfg = obj["config"]
+def eval_only(cfg_path: str, test_npz: str, ckpt_path: str, device_str: str) -> None:
+    cfg = load_config(cfg_path)
 
-    max_len = int(cfg["max_len"])
-    scale = float(cfg["scale"])
-    half_width = float(cfg.get("half_width", 1.0))
-    sanitize_inputs = bool(cfg.get("sanitize_inputs", True))
-    num_candidates = int(cfg.get("num_candidates", 1))
+    obj = torch.load(ckpt_path, map_location="cpu")
+    vocab = obj["vocab"]
+    stoi = obj["stoi"]
+    pad_id = stoi["PAD"]
+    unk_id = stoi["UNK"]
+    cls_id = stoi["CLS"]
+    max_len = int(obj["max_len"])
+    scale = float(obj["scale"])
 
-    expr_te, roots_te = load_split(data_dir, "test")
-    ds_te = ExprCenterASTDataset(expr_te, roots_te, max_len=max_len, sanitize=sanitize_inputs)
-    dl_te = DataLoader(ds_te, batch_size=batch_size, shuffle=False, num_workers=0)
+    device = torch.device(device_str)
+
+    expr_te, roots_te = load_npz_expr_roots(test_npz)
+    ds_te = ExprCenterASTDataset(expr_te, roots_te, max_len=max_len, stoi=stoi, pad_id=pad_id, unk_id=unk_id, cls_id=cls_id, sanitize=True)
+    dl_te = DataLoader(ds_te, batch_size=cfg.training.batch_size, shuffle=False, num_workers=0)
 
     model = ASTPrefixTransformerTopK(
-        vocab_size=len(VOCAB),
+        vocab_size=len(vocab),
         max_len=max_len,
-        num_candidates=num_candidates,
-        d_model=int(cfg["d_model"]),
-        nhead=int(cfg["nhead"]),
-        num_layers=int(cfg["num_layers"]),
+        top_k=cfg.model.top_k,
+        d_model=cfg.model.hidden_dim,
+        nhead=cfg.model.heads,
+        num_layers=cfg.model.layers,
+        num_token="QM",
+        stoi=stoi,
     ).to(device)
     model.load_state_dict(obj["model_state"])
 
-    te = eval_metrics(model, dl_te, device, scale=scale, half_width=half_width)
-    print(f"[EVAL-TEST] hit={te['hit']:.4f}  mae={te['mae']:.4f}  p90={te['p90']:.4f}  p99={te['p99']:.4f}  n={te['n']}")
+    te = eval_metrics(model, dl_te, device, scale=scale)
+    print(
+        f"[EVAL-TEST] "
+        f"min_mae={te['min_mae']:.6g} min_p90={te['min_p90']:.6g} min_p99={te['min_p99']:.6g} | "
+        f"max_mae={te['max_mae']:.6g} max_p90={te['max_p90']:.6g} max_p99={te['max_p99']:.6g} | "
+        f"n={te['n']}"
+    )
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--mode", type=str, default="train", choices=["train", "eval"])
-    p.add_argument("--data-dir", type=str, default="./taylor_data_physchem_v4_interval")
-    p.add_argument("--ckpt", type=str, default="./expr_center_ast_best_50.pt")
+    import os
+    import torch
+    from src.path_utils import find_repo_root, resolve_repo_path, resolve_device
 
-    p.add_argument("--num-candidates", type=int, default=50, help="출력 interval 후보 개수 K")
-    p.add_argument("--auto-max-len", action="store_true", help="train split 토큰길이 p99*1.1로 max_len 자동 설정")
-    p.add_argument("--max-len", type=int, default=25)
+    repo = find_repo_root(__file__)
 
-    p.add_argument("--d-model", type=int, default=256)
-    p.add_argument("--nhead", type=int, default=8)
-    p.add_argument("--num-layers", type=int, default=4)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    # defaults (repo-root 기준 상대경로)
+    cfg_path   = os.environ.get("CFG_PATH", "configs/transformer_interval.yaml")
+    device_str = os.environ.get("DEVICE", "auto")
+    out_dir    = os.environ.get("OUT_DIR", "results/transformer_interval")
+    mode       = os.environ.get("MODE", "train").strip().lower()
 
-    p.add_argument("--half-width", type=float, default=1e-6, help="interval half width (길이2면 1)")
-    p.add_argument("--tie-mse-weight", type=float, default=0.0)
+    train_npz = os.environ.get("TRAIN_NPZ", "data/taylor_data_physchem_v4_interval/taylor_deg25_train.npz")
+    val_npz   = os.environ.get("VAL_NPZ",   "data/taylor_data_physchem_v4_interval/taylor_deg25_val.npz")
+    test_npz  = os.environ.get("TEST_NPZ",  "data/taylor_data_physchem_v4_interval/taylor_deg25_test.npz")
 
-    p.add_argument("--no-sanitize", action="store_true")
+    cfg_path_p  = resolve_repo_path(cfg_path, repo)
+    out_dir_p   = resolve_repo_path(out_dir, repo)
+    train_npz_p = resolve_repo_path(train_npz, repo)
+    val_npz_p   = resolve_repo_path(val_npz, repo)
+    test_npz_p  = resolve_repo_path(test_npz, repo)
 
-    # early stopping
-    p.add_argument("--patience", type=int, default=5)
-    p.add_argument("--min-delta", type=float, default=1e-4)
-    p.add_argument("--metric", type=str, default="hit", choices=["hit", "mae"])
+    device_str = resolve_device(device_str)
 
-    args = p.parse_args()
-    data_dir = Path(args.data_dir)
-    ckpt_path = Path(args.ckpt)
-
-    sanitize_inputs = (not args.no_sanitize)
-
-    if args.mode == "train":
-        train(
-            data_dir=data_dir,
-            ckpt_path=ckpt_path,
-            num_candidates=int(args.num_candidates),
-            auto_max_len=bool(args.auto_max_len),
-            max_len=int(args.max_len),
-            d_model=int(args.d_model),
-            nhead=int(args.nhead),
-            num_layers=int(args.num_layers),
-            batch_size=int(args.batch_size),
-            epochs=int(args.epochs),
-            lr=float(args.lr),
-            device=str(args.device),
-            half_width=float(args.half_width),
-            tie_mse_weight=float(args.tie_mse_weight),
-            sanitize_inputs=bool(sanitize_inputs),
-            patience=int(args.patience),
-            min_delta=float(args.min_delta),
-            metric=str(args.metric),
+    if mode == "train":
+        train_from_yaml(
+            cfg_path=str(cfg_path_p),
+            train_npz=str(train_npz_p),
+            val_npz=str(val_npz_p),
+            test_npz=(str(test_npz_p) if test_npz_p is not None else None),
+            out_dir=str(out_dir_p),
+            device_str=device_str,
         )
     else:
-        run_eval(
-            data_dir=data_dir,
-            ckpt_path=ckpt_path,
-            batch_size=max(256, int(args.batch_size)),
-            device=str(args.device),
+        ckpt_path = (out_dir_p / "best.pt")
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"ckpt not found: {ckpt_path}")
+        eval_only(
+            cfg_path=str(cfg_path_p),
+            test_npz=str(test_npz_p),
+            ckpt_path=str(ckpt_path),
+            device_str=device_str,
         )
+
 
 if __name__ == "__main__":
     main()

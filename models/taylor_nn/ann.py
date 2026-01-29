@@ -1,79 +1,216 @@
 #!/usr/bin/env python3
-# mdpi_fnn_root_npz.py
+# -*- coding: utf-8 -*-
 """
-MDPI (2021) "A Neural Network-Based Approach for Approximating Arbitrary Roots of Polynomials"
-스타일의 Shallow FNN으로 NPZ(root0/root1/root2) 회귀 테스트.
+models/taylor_nn/ann.py
 
-논문 포인트 반영:
-- Shallow FNN: input -> hidden(10, tanh) -> linear output
-- min-max normalization to [-1, 1] (train 기준)
-- (원 논문은 LMA/PSO지만) 여기서는 Adam + (optional) LBFGS로 대체
+✅ YAML(configs/taylor_root_ann.yaml) 기반으로 작동하는 ANN Taylor Root Regressor.
+- add_argument/argparse 없이 동작
+- 입력: Taylor coefficients (order=25 -> 길이 26)
+- 출력: num_roots(=25)개의 root 후보 (B, S)
+- Loss: min_residual
+    각 샘플 i에서 예측 root 후보 r_{i,s}들에 대해
+    Taylor polynomial P_i(r_{i,s})의 |값|을 계산하고,
+    min_s |P_i(r_{i,s})| 의 평균을 최소화.
 
-지원:
-- NPZ keys: coeffs, root0, root1, root2, ...
-- targets: root0 단일 or root0,root1,root2 다중 출력
+실행:
+  python models/taylor_nn/ann.py
 
-예)
-python mdpi_fnn_root_npz.py \
-  --train_npz /home/seokjun/math_12_3/.../taylor_deg_25_train.npz \
-  --val_npz   /home/seokjun/math_12_3/.../taylor_deg_25_val.npz \
-  --test_npz  /home/seokjun/math_12_3/.../taylor_deg_25_test.npz \
-  --targets root0 \
-  --device cuda
+환경변수로 override 가능:
+  TAYLOR_CFG=/path/config.yaml
+  TRAIN_NPZ=/path/train.npz
+  VAL_NPZ=/path/val.npz
+  TEST_NPZ=/path/test.npz
+  OUT_DIR=runs/taylor_root_ann
+  DEVICE=cuda (또는 cpu)
 
-또는 (3개 동시)
-  --targets root0,root1,root2
+NPZ coefficient key 우선순위:
+  coeffs > taylor_coefficients > coefficients
 """
 
 from __future__ import annotations
-import argparse
+
 import os
 import json
+import random
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+try:
+    import yaml  # PyYAML
+except Exception as e:
+    raise ImportError("PyYAML이 필요합니다. `pip install pyyaml`") from e
+
 
 # -------------------------
-# Utils
+# Reproducibility
 # -------------------------
 def set_seed(seed: int = 1234) -> None:
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def parse_targets(s: str) -> List[str]:
-    s = s.strip()
-    if "," in s:
-        return [x.strip() for x in s.split(",") if x.strip()]
-    return [s]
+# -------------------------
+# Config dataclasses
+# -------------------------
+@dataclass
+class ModelCfg:
+    type: str = "taylor_root_regressor"
+    backbone: str = "ann"
+    input_feature: str = "taylor_coefficients"
+    order: int = 25
+    num_roots: int = 25
 
 
-def resolve_triplet_path(p: str) -> Tuple[str, str, str]:
+@dataclass
+class ArchCfg:
+    hidden_dim: int = 25
+    layers: Any = "auto"   # "auto" | int | [int,...]
+    activation: str = "tanh"
+    dropout: float = 0.0
+    bounded_output: bool = False
+    root_range: float = 10.0
+
+
+@dataclass
+class TrainCfg:
+    batch_size: int = 2048
+    epochs: int = 1000
+    learning_rate: float = 3e-5
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0
+    eval_every: int = 1
+    num_workers: int = 0
+    seed: int = 1234
+    early_stop: int = 0  # 0이면 비활성
+
+
+@dataclass
+class LossCfg:
+    type: str = "min_residual"
+    root_clip: float = 0.0           # 0이면 비활성
+    root_l2_weight: float = 0.0      # 0이면 비활성
+    diversity_weight: float = 0.0    # 0이면 비활성
+    diversity_margin: float = 1e-2
+
+
+@dataclass
+class FullCfg:
+    model: ModelCfg
+    architecture: ArchCfg
+    training: TrainCfg
+    loss: LossCfg
+
+
+def _get(d: Dict[str, Any], path: str, default=None):
+    cur = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def load_config(yaml_path: str) -> FullCfg:
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    m = ModelCfg(
+        type=_get(raw, "model.type", "taylor_root_regressor"),
+        backbone=_get(raw, "model.backbone", "ann"),
+        input_feature=_get(raw, "model.input.feature", "taylor_coefficients"),
+        order=int(_get(raw, "model.input.order", 25)),
+        num_roots=int(_get(raw, "model.output.num_roots", 25)),
+    )
+
+    a = ArchCfg(
+        hidden_dim=int(_get(raw, "architecture.hidden_dim", 25)),
+        layers=_get(raw, "architecture.layers", "auto"),
+        activation=str(_get(raw, "architecture.activation", "tanh")),
+        dropout=float(_get(raw, "architecture.dropout", 0.0)),
+        bounded_output=bool(_get(raw, "architecture.bounded_output", False)),
+        root_range=float(_get(raw, "architecture.root_range", 10.0)),
+    )
+
+    t = TrainCfg(
+        batch_size=int(_get(raw, "training.batch_size", 2048)),
+        epochs=int(_get(raw, "training.epochs", 1000)),
+        learning_rate=float(_get(raw, "training.learning_rate", 3e-5)),
+        weight_decay=float(_get(raw, "training.weight_decay", 0.0)),
+        grad_clip=float(_get(raw, "training.grad_clip", 1.0)),
+        eval_every=int(_get(raw, "training.eval_every", 1)),
+        num_workers=int(_get(raw, "training.num_workers", 0)),
+        seed=int(_get(raw, "training.seed", 1234)),
+        early_stop=int(_get(raw, "training.early_stop", 0)),
+    )
+
+    l = LossCfg(
+        type=str(_get(raw, "loss.type", "min_residual")),
+        root_clip=float(_get(raw, "loss.root_clip", 0.0)),
+        root_l2_weight=float(_get(raw, "loss.root_l2_weight", 0.0)),
+        diversity_weight=float(_get(raw, "loss.diversity_weight", 0.0)),
+        diversity_margin=float(_get(raw, "loss.diversity_margin", 1e-2)),
+    )
+
+    return FullCfg(model=m, architecture=a, training=t, loss=l)
+
+
+# -------------------------
+# Dataset (coeff only)
+# -------------------------
+def _pick_coeff_key(keys: List[str]) -> str:
+    cand = ["coeffs", "taylor_coefficients", "coefficients"]
+    for c in cand:
+        if c in keys:
+            return c
+    raise KeyError(f"NPZ에 계수 키가 없습니다. 기대 키: {cand}, 실제 키: {keys}")
+
+
+class TaylorCoeffDataset(Dataset):
     """
-    사용자가 한 번에 'train,val,test' 같은 문자열을 줬을 때 최대한 복원.
-    - 만약 p가 디렉토리면 그 안에서 taylor_deg_*_{train,val,test}.npz를 찾는 건 위험하니(패턴 다양)
-      여기서는 "명시 경로 3개"를 권장.
-    - 그래도 사용자 편의로 p에 'train,val,test'가 들어가면 치환해 줌.
+    NPZ에서 Taylor 계수만 읽는다. (label 없음)
+    order=25면 D=26 (a0..a25)
     """
-    if "train,val,test" in p:
-        train = p.replace("train,val,test", "train")
-        val   = p.replace("train,val,test", "val")
-        test  = p.replace("train,val,test", "test")
-        return train, val, test
-    return p, "", ""
+    def __init__(self, npz_path: str, order: int):
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(npz_path)
+
+        z = np.load(npz_path, mmap_mode="r", allow_pickle=True)
+        keys = list(z.keys())
+        ck = _pick_coeff_key(keys)
+
+        X = np.array(z[ck])
+        if X.ndim == 3:
+            X = np.squeeze(X)
+        if X.ndim != 2:
+            raise ValueError(f"coeffs shape={X.shape} 지원 불가. (N,D)만 지원")
+
+        if X.shape[1] == order:
+            X = np.concatenate([np.zeros((X.shape[0], 1), dtype=X.dtype), X], axis=1)
+        elif X.shape[1] != order + 1:
+            raise ValueError(f"order={order}인데 coeff dim={X.shape[1]} 입니다. 기대: {order+1} (또는 {order})")
+
+        self.X = X.astype(np.float32)
+        self.keys = keys
+        self.coeff_key = ck
+
+    def __len__(self) -> int:
+        return self.X.shape[0]
+
+    def __getitem__(self, idx: int):
+        return torch.from_numpy(self.X[idx])
 
 
+# -------------------------
+# Normalization
+# -------------------------
 def np_minmax_chunked(arr: np.ndarray, chunk: int = 200_000) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    큰 배열도 버티도록 chunk 단위로 min/max 계산.
-    arr: (N, D)
-    """
     n = arr.shape[0]
     mn = None
     mx = None
@@ -82,8 +219,7 @@ def np_minmax_chunked(arr: np.ndarray, chunk: int = 200_000) -> Tuple[np.ndarray
         sl_mn = np.min(sl, axis=0)
         sl_mx = np.max(sl, axis=0)
         if mn is None:
-            mn = sl_mn
-            mx = sl_mx
+            mn, mx = sl_mn, sl_mx
         else:
             mn = np.minimum(mn, sl_mn)
             mx = np.maximum(mx, sl_mx)
@@ -95,299 +231,347 @@ def minmax_to_minus1_1(x: np.ndarray, mn: np.ndarray, mx: np.ndarray, eps: float
     return (2.0 * (x - mn) / den - 1.0).astype(np.float32)
 
 
-def inv_minmax_from_minus1_1(x_scaled: np.ndarray, mn: np.ndarray, mx: np.ndarray) -> np.ndarray:
-    # x_scaled in [-1,1] -> original
-    return ((x_scaled + 1.0) * 0.5 * (mx - mn) + mn).astype(np.float32)
+# -------------------------
+# Polynomial eval (Horner)
+# -------------------------
+def poly_eval_horner(coeffs: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """
+    coeffs: (B, D) with D=order+1
+    x:      (B, S)
+    return: (B, S) P(x)
+    """
+    y = coeffs[:, -1].unsqueeze(1).expand_as(x)
+    for k in range(coeffs.shape[1] - 2, -1, -1):
+        y = y * x + coeffs[:, k].unsqueeze(1)
+    return y
 
 
 # -------------------------
-# Dataset
+# Model (ANN)
 # -------------------------
-class NPZRootDataset(Dataset):
-    def __init__(
-        self,
-        npz_path: str,
-        targets: List[str],
-        x_key: str = "coeffs",
-        mmap: bool = True,
-    ):
-        self.npz_path = npz_path
-        self.targets = targets
-        self.x_key = x_key
-
-        if not os.path.exists(npz_path):
-            raise FileNotFoundError(npz_path)
-
-        self.z = np.load(npz_path, mmap_mode="r" if mmap else None)
-        self.keys = list(self.z.keys())
-
-        if x_key not in self.z:
-            raise KeyError(f"NPZ must contain key '{x_key}'. keys={self.keys}")
-
-        X = self.z[x_key]
-        # 허용: (N,D), (N,D,1), (N,1,D) 등
-        X = np.array(X)
-        if X.ndim == 3:
-            X = np.squeeze(X)
-        if X.ndim != 2:
-            raise ValueError(f"Unsupported coeffs shape={X.shape}. Expect 2D (N,D).")
-
-        ys = []
-        for t in targets:
-            if t not in self.z:
-                raise KeyError(f"NPZ must contain target '{t}'. keys={self.keys}")
-            y = np.array(self.z[t])
-            y = np.squeeze(y)
-            if y.ndim == 1:
-                y = y[:, None]
-            if y.ndim != 2 or y.shape[1] != 1:
-                raise ValueError(f"Target '{t}' shape={y.shape} not supported. Expect (N,) or (N,1).")
-            ys.append(y.astype(np.float32))
-
-        Y = np.concatenate(ys, axis=1)  # (N, K)
-
-        if X.shape[0] != Y.shape[0]:
-            raise ValueError(f"N mismatch: X={X.shape}, Y={Y.shape}")
-
-        self.X = X.astype(np.float32)
-        self.Y = Y.astype(np.float32)
-
-    def __len__(self) -> int:
-        return self.X.shape[0]
-
-    def __getitem__(self, idx: int):
-        return torch.from_numpy(self.X[idx]), torch.from_numpy(self.Y[idx])
+def get_activation(name: str) -> nn.Module:
+    n = name.lower()
+    if n == "tanh":
+        return nn.Tanh()
+    if n == "relu":
+        return nn.ReLU(inplace=True)
+    if n == "gelu":
+        return nn.GELU()
+    if n in ("silu", "swish"):
+        return nn.SiLU(inplace=True)
+    raise ValueError(f"Unsupported activation: {name}")
 
 
-# -------------------------
-# Model (MDPI-style shallow FNN)
-# -------------------------
-class ShallowFNN(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden: int = 10):
+def resolve_layers_auto(in_dim: int, hidden_dim: int) -> List[int]:
+    if in_dim <= 64:
+        n_hidden = 3
+    elif in_dim <= 256:
+        n_hidden = 4
+    else:
+        n_hidden = 5
+    return [hidden_dim] * n_hidden
+
+
+class ANNRootRegressor(nn.Module):
+    """
+    입력: (B, D)
+    출력: (B, S=num_roots)
+    """
+    def __init__(self, in_dim: int, num_roots: int, arch: ArchCfg):
         super().__init__()
-        self.fc1 = nn.Linear(in_dim, hidden)
-        self.act = nn.Tanh()  # tansig
-        self.fc2 = nn.Linear(hidden, out_dim)  # linear output
+        self.arch = arch
+        self.num_roots = num_roots
 
-        # init (안 해도 되지만 안정성 위해)
-        nn.init.xavier_uniform_(self.fc1.weight)
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.xavier_uniform_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
+        if isinstance(arch.layers, str) and arch.layers.lower() == "auto":
+            hlist = resolve_layers_auto(in_dim, arch.hidden_dim)
+        elif isinstance(arch.layers, int):
+            hlist = [arch.hidden_dim] * int(arch.layers)
+        elif isinstance(arch.layers, (list, tuple)):
+            hlist = [int(x) for x in arch.layers]
+        else:
+            raise ValueError(f"Unsupported architecture.layers={arch.layers}")
+
+        act = get_activation(arch.activation)
+
+        layers: List[nn.Module] = []
+        prev = in_dim
+        for h in hlist:
+            layers.append(nn.Linear(prev, h))
+            layers.append(act)
+            if arch.dropout > 0:
+                layers.append(nn.Dropout(p=arch.dropout))
+            prev = h
+
+        self.backbone = nn.Sequential(*layers) if layers else nn.Identity()
+        self.head = nn.Linear(prev, num_roots)
+
+        # init
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.act(self.fc1(x)))
+        h = self.backbone(x)
+        roots = self.head(h)
+        if self.arch.bounded_output:
+            roots = torch.tanh(roots) * float(self.arch.root_range)
+        return roots
 
 
 # -------------------------
-# Train/Eval
+# Loss
+# -------------------------
+def min_residual_loss(coeffs: torch.Tensor, roots: torch.Tensor, loss_cfg: LossCfg) -> torch.Tensor:
+    """
+    coeffs: (B, D)
+    roots:  (B, S)
+    """
+    x = roots
+    if loss_cfg.root_clip and loss_cfg.root_clip > 0:
+        x = torch.clamp(x, -loss_cfg.root_clip, loss_cfg.root_clip)
+
+    p = poly_eval_horner(coeffs, x)              # (B,S)
+    residual = torch.abs(p)                      # (B,S)
+    min_res = torch.min(residual, dim=1).values  # (B,)
+    loss = min_res.mean()
+
+    if loss_cfg.root_l2_weight and loss_cfg.root_l2_weight > 0:
+        loss = loss + float(loss_cfg.root_l2_weight) * (roots ** 2).mean()
+
+    if loss_cfg.diversity_weight and loss_cfg.diversity_weight > 0:
+        r = roots
+        diff = torch.abs(r.unsqueeze(2) - r.unsqueeze(1))  # (B,S,S)
+        mask = 1.0 - torch.eye(r.shape[1], device=r.device).unsqueeze(0)
+        diff = diff * mask
+        margin = float(loss_cfg.diversity_margin)
+        penalty = torch.relu(margin - diff) * mask
+        loss = loss + float(loss_cfg.diversity_weight) * penalty.mean()
+
+    return loss
+
+
+# -------------------------
+# Eval
 # -------------------------
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
-             y_mn: np.ndarray, y_mx: np.ndarray) -> Dict[str, float]:
+def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device, loss_cfg: LossCfg) -> float:
     model.eval()
-    mse_sum = 0.0
-    mae_sum = 0.0
+    total = 0.0
     n = 0
-
-    for xb, yb in loader:
-        xb = xb.to(device)
-        yb = yb.to(device)
-
-        pred = model(xb)  # scaled space
-        # unscale to original space for metrics
-        pred_np = pred.detach().cpu().numpy()
-        yb_np = yb.detach().cpu().numpy()
-
-        pred_org = inv_minmax_from_minus1_1(pred_np, y_mn, y_mx)
-        y_org    = inv_minmax_from_minus1_1(yb_np,  y_mn, y_mx)
-
-        diff = pred_org - y_org
-        mse_sum += float(np.sum(diff * diff))
-        mae_sum += float(np.sum(np.abs(diff)))
-        n += diff.size
-
-    return {
-        "mse": mse_sum / max(n, 1),
-        "mae": mae_sum / max(n, 1),
-    }
+    for xb in loader:
+        xb = xb.to(device, non_blocking=True)
+        roots = model(xb)
+        loss = min_residual_loss(xb, roots, loss_cfg)
+        total += float(loss.item()) * xb.shape[0]
+        n += xb.shape[0]
+    return total / max(n, 1)
 
 
-def train(args):
-    set_seed(args.seed)
-    device = torch.device(args.device)
+# -------------------------
+# Train (YAML)
+# -------------------------
+def train_from_yaml(
+    cfg_path: str,
+    train_npz: str,
+    val_npz: str,
+    test_npz: Optional[str],
+    out_dir: str,
+    device_str: str,
+) -> None:
+    cfg = load_config(cfg_path)
 
-    targets = parse_targets(args.targets)
+    if cfg.model.backbone.lower() != "ann":
+        raise ValueError(f"이 ann.py는 backbone=ann만 처리합니다. 현재: {cfg.model.backbone}")
+    if cfg.loss.type.lower() != "min_residual":
+        raise ValueError(f"이 구현은 loss=min_residual만 처리합니다. 현재: {cfg.loss.type}")
 
-    train_ds_raw = NPZRootDataset(args.train_npz, targets=targets, x_key="coeffs", mmap=True)
-    val_ds_raw   = NPZRootDataset(args.val_npz,   targets=targets, x_key="coeffs", mmap=True)
-    test_ds_raw  = NPZRootDataset(args.test_npz,  targets=targets, x_key="coeffs", mmap=True)
+    os.makedirs(out_dir, exist_ok=True)
+    set_seed(cfg.training.seed)
+    device = torch.device(device_str)
 
-    # train 기준 min/max (논문 스타일)
-    x_mn, x_mx = np_minmax_chunked(train_ds_raw.X, chunk=args.minmax_chunk)
-    y_mn, y_mx = np_minmax_chunked(train_ds_raw.Y, chunk=args.minmax_chunk)
+    train_ds_raw = TaylorCoeffDataset(train_npz, order=cfg.model.order)
+    val_ds_raw   = TaylorCoeffDataset(val_npz,   order=cfg.model.order)
+    test_ds_raw  = TaylorCoeffDataset(test_npz,  order=cfg.model.order) if test_npz else None
 
-    # scale to [-1,1]
+    # normalize using train
+    x_mn, x_mx = np_minmax_chunked(train_ds_raw.X)
     train_X = minmax_to_minus1_1(train_ds_raw.X, x_mn, x_mx)
-    train_Y = minmax_to_minus1_1(train_ds_raw.Y, y_mn, y_mx)
     val_X   = minmax_to_minus1_1(val_ds_raw.X,   x_mn, x_mx)
-    val_Y   = minmax_to_minus1_1(val_ds_raw.Y,   y_mn, y_mx)
-    test_X  = minmax_to_minus1_1(test_ds_raw.X,  x_mn, x_mx)
-    test_Y  = minmax_to_minus1_1(test_ds_raw.Y,  y_mn, y_mx)
+    test_X  = minmax_to_minus1_1(test_ds_raw.X,  x_mn, x_mx) if test_ds_raw else None
 
-    # scaled datasets
-    class _ArrDS(Dataset):
-        def __init__(self, X, Y):
-            self.X = X
-            self.Y = Y
-        def __len__(self): return self.X.shape[0]
-        def __getitem__(self, i):
-            return torch.from_numpy(self.X[i]), torch.from_numpy(self.Y[i])
+    class _DS(Dataset):
+        def __init__(self, X2d: np.ndarray):
+            self.X2d = X2d
+        def __len__(self): return self.X2d.shape[0]
+        def __getitem__(self, i: int):
+            return torch.from_numpy(self.X2d[i])
 
-    train_ds = _ArrDS(train_X, train_Y)
-    val_ds   = _ArrDS(val_X,   val_Y)
-    test_ds  = _ArrDS(test_X,  test_Y)
+    train_ds = _DS(train_X)
+    val_ds   = _DS(val_X)
+    test_ds  = _DS(test_X) if test_X is not None else None
 
-    train_ld = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0, drop_last=True)
-    val_ld   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_ld  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_ld = DataLoader(
+        train_ds,
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=cfg.training.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    val_ld = DataLoader(
+        val_ds,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=cfg.training.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    test_ld = DataLoader(
+        test_ds,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=cfg.training.num_workers,
+        pin_memory=(device.type == "cuda"),
+    ) if test_ds is not None else None
 
     in_dim = train_X.shape[1]
-    out_dim = train_Y.shape[1]
+    model = ANNRootRegressor(in_dim=in_dim, num_roots=cfg.model.num_roots, arch=cfg.architecture).to(device)
 
-    model = ShallowFNN(in_dim=in_dim, out_dim=out_dim, hidden=args.hidden).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-    loss_fn = nn.MSELoss()
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.training.learning_rate,
+        weight_decay=cfg.training.weight_decay,
+    )
 
-    best = float("inf")
+    ckpt_path = os.path.join(out_dir, "best.pt")
+    scaler_path = os.path.join(out_dir, "scaler.json")
+    cfg_dump_path = os.path.join(out_dir, "config_resolved.json")
+
+    with open(scaler_path, "w", encoding="utf-8") as f:
+        json.dump({"x_min": x_mn.tolist(), "x_max": x_mx.tolist()}, f, ensure_ascii=False, indent=2)
+
+    with open(cfg_dump_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "model": cfg.model.__dict__,
+            "architecture": cfg.architecture.__dict__,
+            "training": cfg.training.__dict__,
+            "loss": cfg.loss.__dict__,
+        }, f, ensure_ascii=False, indent=2)
+
+    print(f"[CONFIG] {cfg_path}")
+    print(f"[DATA] train={len(train_ds)} val={len(val_ds)} test={(len(test_ds) if test_ds else 0)}")
+    print(f"[NPZ] train coeff_key={train_ds_raw.coeff_key}, keys={train_ds_raw.keys}")
+    print(f"[SHAPE] coeff_dim(D)={in_dim}, num_roots={cfg.model.num_roots}")
+    print(f"[MODEL] hidden_dim={cfg.architecture.hidden_dim}, layers={cfg.architecture.layers}, act={cfg.architecture.activation}")
+    print(f"[OUT] {out_dir}")
+
+    best_val = float("inf")
     patience = 0
 
-    print(f"[DATA] train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
-    print(f"[SHAPE] X_dim={in_dim} Y_dim={out_dim} targets={targets}")
-    print(f"[NPZ keys] train keys={train_ds_raw.keys}")
-
-    # save scaler
-    os.makedirs(os.path.dirname(args.ckpt) or ".", exist_ok=True)
-    scaler_path = args.ckpt + ".scaler.json"
-    with open(scaler_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "x_min": x_mn.tolist(),
-            "x_max": x_mx.tolist(),
-            "y_min": y_mn.tolist(),
-            "y_max": y_mx.tolist(),
-            "targets": targets,
-        }, f, ensure_ascii=False)
-
-    for ep in range(1, args.epochs + 1):
+    for ep in range(1, cfg.training.epochs + 1):
         model.train()
         running = 0.0
+        steps = 0
 
-        for xb, yb in train_ld:
-            xb = xb.to(device)
-            yb = yb.to(device)
+        for xb in train_ld:
+            xb = xb.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
 
-            opt.zero_grad()
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
+            roots = model(xb)
+            loss = min_residual_loss(xb, roots, cfg.loss)
 
             if not torch.isfinite(loss):
                 continue
 
             loss.backward()
-            if args.grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            if cfg.training.grad_clip and cfg.training.grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
             opt.step()
+
             running += float(loss.item())
+            steps += 1
 
-        if ep % args.eval_every == 0:
-            val_metrics = evaluate(model, val_ld, device, y_mn=y_mn, y_mx=y_mx)
-            val_mse = val_metrics["mse"]
-            print(f"[ep={ep:5d}] train_loss={running/max(len(train_ld),1):.6g}  "
-                  f"val_mse={val_mse:.6g} val_mae={val_metrics['mae']:.6g}")
+        if ep % max(cfg.training.eval_every, 1) == 0:
+            tr_loss = running / max(steps, 1)
+            val_loss = eval_epoch(model, val_ld, device, cfg.loss)
+            print(f"[ep={ep:4d}] train_loss={tr_loss:.6g}  val_loss={val_loss:.6g}")
 
-            if val_mse < best:
-                best = val_mse
+            if val_loss < best_val:
+                best_val = val_loss
                 patience = 0
-                torch.save({
-                    "model": model.state_dict(),
-                    "in_dim": in_dim,
-                    "out_dim": out_dim,
-                    "hidden": args.hidden,
-                    "targets": targets,
-                    "scaler_json": scaler_path,
-                }, args.ckpt)
-                print(f"  -> save best: {args.ckpt}")
+                torch.save(
+                    {
+                        "state_dict": model.state_dict(),
+                        "in_dim": in_dim,
+                        "num_roots": cfg.model.num_roots,
+                        "arch": cfg.architecture.__dict__,
+                        "loss": cfg.loss.__dict__,
+                        "scaler_json": scaler_path,
+                        "config_json": cfg_dump_path,
+                        "best_val": best_val,
+                    },
+                    ckpt_path,
+                )
+                print(f"  -> save best: {ckpt_path}")
             else:
-                patience += 1
-                if patience >= args.early_stop:
-                    print("Early stop.")
-                    break
+                if cfg.training.early_stop and cfg.training.early_stop > 0:
+                    patience += 1
+                    if patience >= cfg.training.early_stop:
+                        print("[EARLY STOP]")
+                        break
 
-    # optional LBFGS refine (근사-LMA 느낌)
-    if args.lbfgs_iters > 0:
-        print(f"[LBFGS] refining with iters={args.lbfgs_iters}, subset={args.lbfgs_subset}")
-        model.train()
-        # subset pick
-        n_sub = min(args.lbfgs_subset, train_X.shape[0]) if args.lbfgs_subset > 0 else train_X.shape[0]
-        xb = torch.from_numpy(train_X[:n_sub]).to(device)
-        yb = torch.from_numpy(train_Y[:n_sub]).to(device)
-        opt2 = torch.optim.LBFGS(model.parameters(), max_iter=args.lbfgs_iters, line_search_fn="strong_wolfe")
+    if test_ld is not None and os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ck["state_dict"])
+        test_loss = eval_epoch(model, test_ld, device, cfg.loss)
+        print(f"[TEST] loss(min_residual)={test_loss:.6g}")
 
-        def closure():
-            opt2.zero_grad()
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
-            if torch.isfinite(loss):
-                loss.backward()
-            return loss
-
-        try:
-            opt2.step(closure)
-        except RuntimeError as e:
-            print(f"[LBFGS] RuntimeError: {e}")
-
-    # load best and test
-    ck = torch.load(args.ckpt, map_location=device)
-    model.load_state_dict(ck["model"])
-    test_metrics = evaluate(model, test_ld, device, y_mn=y_mn, y_mx=y_mx)
-    print(f"[TEST] mse={test_metrics['mse']:.6g} mae={test_metrics['mae']:.6g}")
-    print(f"[DONE] scaler saved: {scaler_path}")
+    print("[DONE]")
 
 
-def build_argparser():
-    p = argparse.ArgumentParser()
-    p.add_argument("--train_npz", type=str, default="/home/seokjun/math_12_3/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz")
-    p.add_argument("--val_npz",   type=str, default="/home/seokjun/math_12_3/taylor_data_physchem_v4_deg25/taylor_deg25_val.npz")
-    p.add_argument("--test_npz",  type=str, default="/home/seokjun/math_12_3/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz")
+# -------------------------
+# Entrypoint (No argparse)
+# -------------------------
+def main() -> None:
+    import os
+    import torch
+    from src.path_utils import find_repo_root, resolve_repo_path, resolve_device
 
-    p.add_argument("--targets", type=str, default="root0",
-                   help="e.g., root0  or  root0,root1,root2")
+    repo = find_repo_root(__file__)
 
-    # MDPI-style: hidden=10, tanh
-    p.add_argument("--hidden", type=int, default=10)
+    default_cfg   = "configs/taylor_root_ann.yaml"
+    default_train = "data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz"
+    default_val   = "data/taylor_data_physchem_v4_deg25/taylor_deg25_val.npz"
+    default_test  = "data/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz"
+    default_out   = "results/taylor_nn/ann"   # ✅ 네 구조(results 폴더) 기준
+    default_dev   = "auto"
 
-    p.add_argument("--batch_size", type=int, default=2048)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--epochs", type=int, default=6000)
-    p.add_argument("--eval_every", type=int, default=5)
-    p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--early_stop", type=int, default=300)
+    cfg_path   = os.environ.get("TAYLOR_CFG", default_cfg)
+    train_npz  = os.environ.get("TRAIN_NPZ",  default_train)
+    val_npz    = os.environ.get("VAL_NPZ",    default_val)
+    test_npz   = os.environ.get("TEST_NPZ",   default_test)
+    out_dir    = os.environ.get("OUT_DIR",    default_out)
+    device_str = os.environ.get("DEVICE",     default_dev)
 
-    # minmax chunk
-    p.add_argument("--minmax_chunk", type=int, default=200_000)
+    cfg_path_p  = resolve_repo_path(cfg_path, repo)
+    train_npz_p = resolve_repo_path(train_npz, repo)
+    val_npz_p   = resolve_repo_path(val_npz, repo)
+    test_npz_p  = resolve_repo_path(test_npz, repo)  # 빈 문자열이면 None 처리됨
+    out_dir_p   = resolve_repo_path(out_dir, repo)
 
-    # optional LBFGS refine
-    p.add_argument("--lbfgs_iters", type=int, default=0,
-                   help="0이면 비활성. (예: 50~200)")
-    p.add_argument("--lbfgs_subset", type=int, default=50_000,
-                   help="LBFGS에 쓸 train 샘플 수(0이면 전체).")
+    device_str = resolve_device(device_str)
 
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--ckpt", type=str, default="mdpi_fnn_best.pt")
-    return p
+    train_from_yaml(
+        cfg_path=str(cfg_path_p),
+        train_npz=str(train_npz_p),
+        val_npz=str(val_npz_p),
+        test_npz=(str(test_npz_p) if test_npz_p is not None else None),
+        out_dir=str(out_dir_p),
+        device_str=device_str,
+    )
 
 
 if __name__ == "__main__":
-    args = build_argparser().parse_args()
-    train(args)
+    main()

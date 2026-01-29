@@ -1,0 +1,46 @@
+dataset:
+  version: interval_physchem_v4
+  degree: 25
+  n_total: 1000000
+  seed: 42
+  out_dir: "./taylor_data_physchem_v4_interval"   # 기본 출력 폴더
+
+templates:
+  n_templates: 5000
+  max_terms: 3
+  max_depth: 2
+
+roots:
+  root_range: 1.0
+  num_intervals: 800
+  max_roots_keep: 8
+
+strings:
+  save_expr_str: true
+  float_sig: 6
+
+filters:
+  y_abs_max: 50.0
+  y_ptp_min: 0.001
+  y_grid_n: 201
+
+terms:
+  include_tan: false
+  base_transc_terms:
+    - sin
+    - cos
+    - exp
+    - sinh
+    - cosh
+    - tanh
+    - ln
+    - log
+    - inv
+    - sqrt1p
+
+poly:
+  poly_degs: [1, 2, 3, 4, 5, 7, 10]
+  min_poly_norm: 1.0e-8
+
+runtime:
+  max_retry_factor: 80

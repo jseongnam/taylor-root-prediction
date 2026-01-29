@@ -1,0 +1,88 @@
+# configs/eval_final_0124.yaml
+
+paths:
+  data_dir: "/home/seokjun/math_12_3"
+  test_npz: "v6/taylor_test_physchem_v3_allroots_10000.npz"
+  ast_ckpt: "/home/seokjun/math_12_3/expr_center_ast_best_10.pt"
+
+  anchored_ckpt: "/home/seokjun/math_12_3/taylor_data_physchem_v4_deg25/v4_expect25_deg25_mlp_hd25_best_fx_mse.pt"
+  ann_ckpt: "/home/seokjun/math_12_3/mdpi_fnn_best.pt"
+  lstm_ckpt: "/home/seokjun/math_12_3/lstm_root_best_npz.pt"
+
+run:
+  outdir: "runs/eval_final_0124"
+  device: "cuda"              # "cpu"도 가능
+  batch_size: 256
+
+k_sweep:
+  topk_list: [5, 10, 15, 20, 25]
+  max_tries: 10
+  proxy: "poly"               # "poly" or "true"
+  stop_after_first_success: false
+
+solver:
+  compare_thr: 1.0e-10
+  tol_f: 1.0e-10
+  solver_mode: "newton_bisect"          # newton / bisect / newton_bisect
+  anchored_solver_mode: ""              # "" means same as solver_mode
+  newton_iters: 30
+  newton_max_step: 2.0
+  bisect_iters: 60
+
+local_scan:
+  local_radius: 1.0
+  local_scan_n: 101
+  local_max_brackets: 10
+
+postcheck:
+  stable_radius: 1.0
+  stable_scan_n: 80
+  stable_valid_min: 0.7
+  stable_dfx_min: 1.0e-10
+
+baseline:
+  mode: "all"                 # all / on_demand / none
+  scan_xmin: -20.0
+  scan_xmax: +20.0
+  scan_n: 250
+  topk: 10
+  cache_path: ""              # 예: "runs/baseline_cache.npz"  (없으면 빈 문자열)
+  cache_save: false           # true로 하면 cache_path에 저장/업데이트
+
+anchored_fb:
+  mode: "auto"                # auto / on / off
+
+threshold:
+  thr_sweep: [1.0e-6, 1.0e-8, 1.0e-10, 1.0e-12]
+  thr_winner_okonly: true
+
+reports:
+  report_funcid_winner: true
+  report_funcid_winner_mode: "both"     # any / okonly / both
+  report_funcid_winner_expr_k: 3
+  report_funcid_winner_topn: 50
+
+  report_fail_funcid: true
+  report_fail_mode: "baseline"          # baseline / all
+  report_fail_funcid_topn: 30
+  report_fail_expr_k: 3
+  report_fail_save: true               # csv/json 저장
+
+plots:
+  plot_residual_hist: true
+  plot_funcid_box: true
+  plot_topn_funcid: 15
+
+symbolic:
+  use_sympy_poly: false
+  use_sympy_nsolve: false
+  symbolic_max_n: 0              # 0이면 전체, >0이면 앞에서 N개만
+  symbolic_only_fails: false
+  sympy_poly_maxroots: 50
+  sympy_nsolve_maxtries: 10
+
+debug_dump:
+  dump_jsonl: ""                 # 예: "fails.jsonl" (없으면 빈 문자열)
+  dump_method: "anchored_fb"     # anchored / ann / lstm / baseline / anchored_fb
+  dump_max: 200
+  dump_thr: null                 # null이면 compare_thr 사용

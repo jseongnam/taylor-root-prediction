@@ -1,34 +1,49 @@
 #!/usr/bin/env python3
-# lstm_model_ieee.py
+# -*- coding: utf-8 -*-
 """
-LSTM baseline for your Taylor NPZ dataset.
+models/taylor_nn/lstm.py
 
-NPZ keys (confirmed):
-  ['coeffs', 'root0', 'root1', 'root2', 'func_id', 'degree',
-   'template_str', 'norm_scale', 'expr_str']
+✅ YAML(configs/taylor_root_lstm.yaml) 기반으로 작동하는 LSTM Taylor Root Regressor.
+- add_argument/argparse 없이 동작
+- 입력: Taylor coefficients (order=25 -> 길이 26)
+- 출력: num_roots(=25)개의 root 후보 (B, S)
+- Loss: min_residual
+    각 샘플 i에서 예측 root 후보 r_{i,s}들에 대해
+    Taylor polynomial P_i(r_{i,s})의 |값|을 계산하고,
+    min_s |P_i(r_{i,s})| 의 평균을 최소화.
 
-We will train:
-  input  : coeffs  -> treated as a sequence (N, T, 1)
-  target : root0 (default)
+실행:
+  python models/taylor_nn/lstm.py
 
-Options:
-  --target_root {root0,root1,root2}
-  --use_extra_roots   (append root1/root2 to the coeff sequence as extra "tokens")
+환경변수로 override 가능:
+  TAYLOR_CFG=/path/config.yaml
+  TRAIN_NPZ=/path/train.npz
+  VAL_NPZ=/path/val.npz
+  TEST_NPZ=/path/test.npz
+  OUT_DIR=runs/taylor_root_lstm
+  DEVICE=cuda (또는 cpu)
 
-Run:
-  python lstm_model_ieee.py --device cuda
+NPZ coefficient key 우선순위:
+  coeffs > taylor_coefficients > coefficients
 """
 
 from __future__ import annotations
-import argparse
+
 import os
+import json
 import random
-from typing import Dict, Tuple, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
+try:
+    import yaml  # PyYAML
+except Exception as e:
+    raise ImportError("PyYAML이 필요합니다. `pip install pyyaml`") from e
 
 
 # -------------------------
@@ -42,100 +57,235 @@ def set_seed(seed: int = 1234) -> None:
 
 
 # -------------------------
-# Dataset (your NPZ format)
+# Config dataclasses
 # -------------------------
-class NPZRootDataset(Dataset):
-    """
-    Loads NPZ with keys:
-      coeffs: (N, T)  or (N, T, 1)   (float)
-      root0/root1/root2: (N,) or (N,1)
-      (other keys ignored)
+@dataclass
+class ModelCfg:
+    type: str = "taylor_root_regressor"
+    backbone: str = "lstm"
+    input_feature: str = "taylor_coefficients"
+    order: int = 25
+    num_roots: int = 25
 
-    Output:
-      X: (T, 1) or (T+K, 1) if use_extra_roots
-      y: (1,)
-    """
 
-    def __init__(
-        self,
-        npz_path: str,
-        target_root: str = "root0",
-        use_extra_roots: bool = False,
-        x_clip: Optional[float] = None,
-    ):
+@dataclass
+class ArchCfg:
+    hidden_dim: int = 25
+    layers: Any = "auto"   # "auto" | int
+    dropout: float = 0.0
+    activation: str = "tanh"  # head activation
+    # output control
+    bounded_output: bool = False
+    root_range: float = 10.0
+
+
+@dataclass
+class TrainCfg:
+    batch_size: int = 2048
+    epochs: int = 1000
+    learning_rate: float = 3e-5
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0
+    eval_every: int = 1
+    num_workers: int = 0
+    seed: int = 1234
+    early_stop: int = 0  # 0이면 비활성
+
+
+@dataclass
+class LossCfg:
+    type: str = "min_residual"
+    root_clip: float = 0.0           # 0이면 비활성
+    root_l2_weight: float = 0.0      # 0이면 비활성
+    diversity_weight: float = 0.0    # 0이면 비활성
+    diversity_margin: float = 1e-2
+
+
+@dataclass
+class FullCfg:
+    model: ModelCfg
+    architecture: ArchCfg
+    training: TrainCfg
+    loss: LossCfg
+
+
+def _get(d: Dict[str, Any], path: str, default=None):
+    cur = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def load_config(yaml_path: str) -> FullCfg:
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    m = ModelCfg(
+        type=_get(raw, "model.type", "taylor_root_regressor"),
+        backbone=_get(raw, "model.backbone", "lstm"),
+        input_feature=_get(raw, "model.input.feature", "taylor_coefficients"),
+        order=int(_get(raw, "model.input.order", 25)),
+        num_roots=int(_get(raw, "model.output.num_roots", 25)),
+    )
+
+    a = ArchCfg(
+        hidden_dim=int(_get(raw, "architecture.hidden_dim", 25)),
+        layers=_get(raw, "architecture.layers", "auto"),
+        dropout=float(_get(raw, "architecture.dropout", 0.0)),
+        activation=str(_get(raw, "architecture.activation", "tanh")),
+        bounded_output=bool(_get(raw, "architecture.bounded_output", False)),
+        root_range=float(_get(raw, "architecture.root_range", 10.0)),
+    )
+
+    t = TrainCfg(
+        batch_size=int(_get(raw, "training.batch_size", 2048)),
+        epochs=int(_get(raw, "training.epochs", 1000)),
+        learning_rate=float(_get(raw, "training.learning_rate", 3e-5)),
+        weight_decay=float(_get(raw, "training.weight_decay", 0.0)),
+        grad_clip=float(_get(raw, "training.grad_clip", 1.0)),
+        eval_every=int(_get(raw, "training.eval_every", 1)),
+        num_workers=int(_get(raw, "training.num_workers", 0)),
+        seed=int(_get(raw, "training.seed", 1234)),
+        early_stop=int(_get(raw, "training.early_stop", 0)),
+    )
+
+    l = LossCfg(
+        type=str(_get(raw, "loss.type", "min_residual")),
+        root_clip=float(_get(raw, "loss.root_clip", 0.0)),
+        root_l2_weight=float(_get(raw, "loss.root_l2_weight", 0.0)),
+        diversity_weight=float(_get(raw, "loss.diversity_weight", 0.0)),
+        diversity_margin=float(_get(raw, "loss.diversity_margin", 1e-2)),
+    )
+
+    return FullCfg(model=m, architecture=a, training=t, loss=l)
+
+
+# -------------------------
+# Dataset (coeff only)
+# -------------------------
+def _pick_coeff_key(keys: List[str]) -> str:
+    cand = ["coeffs", "taylor_coefficients", "coefficients"]
+    for c in cand:
+        if c in keys:
+            return c
+    raise KeyError(f"NPZ에 계수 키가 없습니다. 기대 키: {cand}, 실제 키: {keys}")
+
+
+class TaylorCoeffSeqDataset(Dataset):
+    """
+    NPZ에서 Taylor 계수만 읽어서 (T,1) 시퀀스로 반환.
+    order=25면 D=26이어야 정상 (a0..a25)
+    """
+    def __init__(self, npz_path: str, order: int):
         if not os.path.exists(npz_path):
-            raise FileNotFoundError(f"NPZ not found: {npz_path}")
+            raise FileNotFoundError(npz_path)
 
-        data = np.load(npz_path, allow_pickle=True)
-        keys = list(data.keys())
+        z = np.load(npz_path, mmap_mode="r", allow_pickle=True)
+        keys = list(z.keys())
+        ck = _pick_coeff_key(keys)
 
-        if "coeffs" not in data:
-            raise KeyError(f"NPZ must contain key 'coeffs'. keys={keys}")
-        if target_root not in data:
-            raise KeyError(f"NPZ must contain key '{target_root}'. keys={keys}")
+        X = np.array(z[ck])
+        if X.ndim == 3:
+            X = np.squeeze(X)
+        if X.ndim != 2:
+            raise ValueError(f"coeffs shape={X.shape} 지원 불가. (N,D)만 지원")
 
-        coeffs = data["coeffs"]  # (N,T) or (N,T,1)
-        y = data[target_root]    # (N,) or (N,1)
+        # D 체크: D=order+1(권장) 또는 D=order(상수항 누락 가정)
+        if X.shape[1] == order:
+            X = np.concatenate([np.zeros((X.shape[0], 1), dtype=X.dtype), X], axis=1)
+        elif X.shape[1] != order + 1:
+            raise ValueError(f"order={order}인데 coeff dim={X.shape[1]} 입니다. 기대: {order+1} (또는 {order})")
 
-        # coeffs shape normalize -> (N,T)
-        if coeffs.ndim == 3 and coeffs.shape[-1] == 1:
-            coeffs = coeffs[:, :, 0]
-        elif coeffs.ndim != 2:
-            raise ValueError(f"Expected coeffs shape (N,T) or (N,T,1), got {coeffs.shape}")
-
-        # y shape normalize -> (N,1)
-        if y.ndim == 1:
-            y = y[:, None]
-        elif y.ndim == 2 and y.shape[1] == 1:
-            pass
-        else:
-            raise ValueError(f"Expected {target_root} shape (N,) or (N,1), got {y.shape}")
-
-        # Optional: append extra roots as additional sequence tokens
-        # (This mimics your chain-feature idea; for pure IEEE LSTM baseline keep it off.)
-        if use_extra_roots:
-            # if root1/root2 exist, append them (N,2) at end of coeffs time axis
-            extras = []
-            for rk in ["root1", "root2"]:
-                if rk in data:
-                    r = data[rk]
-                    if r.ndim == 1:
-                        r = r[:, None]
-                    extras.append(r.astype(np.float32))
-            if len(extras) > 0:
-                extra_mat = np.concatenate(extras, axis=1)  # (N, K)
-                coeffs = np.concatenate([coeffs, extra_mat], axis=1)  # (N, T+K)
-
-        coeffs = coeffs.astype(np.float32)
-        y = y.astype(np.float32)
-
-        if x_clip is not None and np.isfinite(x_clip) and x_clip > 0:
-            y = np.clip(y, -x_clip, x_clip)
-
-        # Final tensor shapes:
-        # X: (N, T, 1), y: (N, 1)
-        X = coeffs[:, :, None]
-
-        self.X = torch.from_numpy(X)
-        self.y = torch.from_numpy(y)
-
+        self.X = X.astype(np.float32)  # (N, D)
         self.keys = keys
-        self.target_root = target_root
-        self.use_extra_roots = use_extra_roots
+        self.coeff_key = ck
+        self.order = order
 
     def __len__(self) -> int:
         return self.X.shape[0]
 
     def __getitem__(self, idx: int):
-        return self.X[idx], self.y[idx]
+        # (D,) -> (T=D,1)
+        x = self.X[idx][:, None]
+        return torch.from_numpy(x)
+
+
+# -------------------------
+# Normalization (min-max -> [-1,1])
+# -------------------------
+def np_minmax_chunked(arr: np.ndarray, chunk: int = 200_000) -> Tuple[np.ndarray, np.ndarray]:
+    n = arr.shape[0]
+    mn = None
+    mx = None
+    for i in range(0, n, chunk):
+        sl = arr[i:i+chunk]
+        sl_mn = np.min(sl, axis=0)
+        sl_mx = np.max(sl, axis=0)
+        if mn is None:
+            mn, mx = sl_mn, sl_mx
+        else:
+            mn = np.minimum(mn, sl_mn)
+            mx = np.maximum(mx, sl_mx)
+    return mn.astype(np.float32), mx.astype(np.float32)
+
+
+def minmax_to_minus1_1(x: np.ndarray, mn: np.ndarray, mx: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    den = np.maximum(mx - mn, eps)
+    return (2.0 * (x - mn) / den - 1.0).astype(np.float32)
+
+
+# -------------------------
+# Polynomial eval (Horner)
+# -------------------------
+def poly_eval_horner(coeffs: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """
+    coeffs: (B, D)  with D=order+1, coeffs[:,0]=a0 ... coeffs[:,D-1]=a_order
+    x:      (B, S)
+    return: (B, S)  P(x)
+    """
+    y = coeffs[:, -1].unsqueeze(1).expand_as(x)
+    for k in range(coeffs.shape[1] - 2, -1, -1):
+        y = y * x + coeffs[:, k].unsqueeze(1)
+    return y
 
 
 # -------------------------
 # Model
 # -------------------------
+def resolve_lstm_layers_auto(seq_len: int) -> int:
+    # 시퀀스 길이(D=26) 기준이면 2층이 무난
+    if seq_len <= 32:
+        return 2
+    if seq_len <= 128:
+        return 3
+    return 4
+
+
+def head_activation(name: str) -> nn.Module:
+    n = name.lower()
+    if n == "tanh":
+        return nn.Tanh()
+    if n == "relu":
+        return nn.ReLU(inplace=True)
+    if n == "gelu":
+        return nn.GELU()
+    if n in ("silu", "swish"):
+        return nn.SiLU(inplace=True)
+    raise ValueError(f"Unsupported head activation: {name}")
+
+
 class LSTMRootRegressor(nn.Module):
-    def __init__(self, hidden: int = 128, num_layers: int = 2, dropout: float = 0.0):
+    """
+    입력: (B, T, 1)
+    출력: (B, S=num_roots)
+    """
+    def __init__(self, hidden: int, num_layers: int, dropout: float, num_roots: int, arch: ArchCfg):
         super().__init__()
+        self.arch = arch
+        self.num_roots = num_roots
+
         self.lstm = nn.LSTM(
             input_size=1,
             hidden_size=hidden,
@@ -143,215 +293,304 @@ class LSTMRootRegressor(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
+
+        act = head_activation(arch.activation)
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, 1),
+            act,
+            nn.Linear(hidden, num_roots),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, 1)
-        _, (h_n, _) = self.lstm(x)
-        h_last = h_n[-1]          # (B, hidden)
-        return self.head(h_last)  # (B, 1)
+        # init
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x_seq: torch.Tensor) -> torch.Tensor:
+        # x_seq: (B, T, 1)
+        _, (h_n, _) = self.lstm(x_seq)
+        h_last = h_n[-1]            # (B, hidden)
+        roots = self.head(h_last)   # (B, S)
+
+        if self.arch.bounded_output:
+            roots = torch.tanh(roots) * float(self.arch.root_range)
+
+        return roots
+
+
+# -------------------------
+# Loss
+# -------------------------
+def min_residual_loss(coeff_seq: torch.Tensor, roots: torch.Tensor, loss_cfg: LossCfg) -> torch.Tensor:
+    """
+    coeff_seq: (B, T, 1)  (scaled space)
+    roots:     (B, S)
+    """
+    coeffs = coeff_seq.squeeze(-1)  # (B, D)
+
+    x = roots
+    if loss_cfg.root_clip and loss_cfg.root_clip > 0:
+        x = torch.clamp(x, -loss_cfg.root_clip, loss_cfg.root_clip)
+
+    p = poly_eval_horner(coeffs, x)              # (B,S)
+    residual = torch.abs(p)                      # (B,S)
+    min_res = torch.min(residual, dim=1).values  # (B,)
+    loss = min_res.mean()
+
+    # 발산 방지
+    if loss_cfg.root_l2_weight and loss_cfg.root_l2_weight > 0:
+        loss = loss + float(loss_cfg.root_l2_weight) * (roots ** 2).mean()
+
+    # collapse 방지(선택)
+    if loss_cfg.diversity_weight and loss_cfg.diversity_weight > 0:
+        r = roots
+        diff = torch.abs(r.unsqueeze(2) - r.unsqueeze(1))  # (B,S,S)
+        mask = 1.0 - torch.eye(r.shape[1], device=r.device).unsqueeze(0)
+        diff = diff * mask
+        margin = float(loss_cfg.diversity_margin)
+        penalty = torch.relu(margin - diff) * mask
+        loss = loss + float(loss_cfg.diversity_weight) * penalty.mean()
+
+    return loss
 
 
 # -------------------------
 # Eval
 # -------------------------
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, tol: float = 1e-2) -> Dict[str, float]:
+def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device, loss_cfg: LossCfg) -> float:
     model.eval()
-    mse_sum = 0.0
-    mae_sum = 0.0
+    total = 0.0
     n = 0
-    hit = 0
-
-    for X, y in loader:
-        X = X.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        pred = model(X)
-        diff = pred - y
-
-        mse_sum += float((diff.pow(2)).sum().item())
-        mae_sum += float(diff.abs().sum().item())
-        n += y.numel()
-        hit += int((diff.abs() < tol).sum().item())
-
-    denom = max(n, 1)
-    return {
-        "mse": mse_sum / denom,
-        "mae": mae_sum / denom,
-        "hit@tol": hit / denom,
-    }
+    for xb in loader:
+        xb = xb.to(device, non_blocking=True)
+        roots = model(xb)
+        loss = min_residual_loss(xb, roots, loss_cfg)
+        total += float(loss.item()) * xb.shape[0]
+        n += xb.shape[0]
+    return total / max(n, 1)
 
 
 # -------------------------
-# Train
+# Main Train
 # -------------------------
-def build_paths(data_dir: str, degree: int) -> Tuple[str, str, str]:
-    train_npz = os.path.join(data_dir, f"taylor_deg{degree}_train.npz")
-    val_npz   = os.path.join(data_dir, f"taylor_deg{degree}_val.npz")
-    test_npz  = os.path.join(data_dir, f"taylor_deg{degree}_test.npz")
-    return train_npz, val_npz, test_npz
+def train_from_yaml(
+    cfg_path: str,
+    train_npz: str,
+    val_npz: str,
+    test_npz: Optional[str],
+    out_dir: str,
+    device_str: str,
+) -> None:
+    cfg = load_config(cfg_path)
 
+    if cfg.model.backbone.lower() != "lstm":
+        raise ValueError(f"이 lstm.py는 backbone=lstm만 처리합니다. 현재: {cfg.model.backbone}")
+    if cfg.loss.type.lower() != "min_residual":
+        raise ValueError(f"이 구현은 loss=min_residual만 처리합니다. 현재: {cfg.loss.type}")
 
-def train(args) -> None:
-    set_seed(args.seed)
-    device = torch.device(args.device)
+    os.makedirs(out_dir, exist_ok=True)
+    set_seed(cfg.training.seed)
+    device = torch.device(device_str)
 
-    train_npz, val_npz, test_npz = build_paths(args.data_dir, args.degree)
+    # raw dataset (coeff only)
+    train_ds_raw = TaylorCoeffSeqDataset(train_npz, order=cfg.model.order)
+    val_ds_raw   = TaylorCoeffSeqDataset(val_npz,   order=cfg.model.order)
+    test_ds_raw  = TaylorCoeffSeqDataset(test_npz,  order=cfg.model.order) if test_npz else None
 
-    train_ds = NPZRootDataset(
-        train_npz,
-        target_root=args.target_root,
-        use_extra_roots=args.use_extra_roots,
-        x_clip=args.y_clip,
-    )
-    val_ds = NPZRootDataset(
-        val_npz,
-        target_root=args.target_root,
-        use_extra_roots=args.use_extra_roots,
-        x_clip=args.y_clip,
-    )
-    test_ds = NPZRootDataset(
-        test_npz,
-        target_root=args.target_root,
-        use_extra_roots=args.use_extra_roots,
-        x_clip=args.y_clip,
-    )
+    # min-max normalize using train (on (N,D))
+    x_mn, x_mx = np_minmax_chunked(train_ds_raw.X)
+    train_X = minmax_to_minus1_1(train_ds_raw.X, x_mn, x_mx)  # (N,D)
+    val_X   = minmax_to_minus1_1(val_ds_raw.X,   x_mn, x_mx)
+    test_X  = minmax_to_minus1_1(test_ds_raw.X,  x_mn, x_mx) if test_ds_raw else None
+
+    class _SeqDS(Dataset):
+        def __init__(self, X2d: np.ndarray):
+            self.X2d = X2d
+        def __len__(self): return self.X2d.shape[0]
+        def __getitem__(self, i: int):
+            return torch.from_numpy(self.X2d[i][:, None])  # (D,1)
+
+    train_ds = _SeqDS(train_X)
+    val_ds   = _SeqDS(val_X)
+    test_ds  = _SeqDS(test_X) if test_X is not None else None
 
     train_ld = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
+        batch_size=cfg.training.batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=0,
+        num_workers=cfg.training.num_workers,
         pin_memory=(device.type == "cuda"),
     )
     val_ld = DataLoader(
         val_ds,
-        batch_size=args.batch_size,
+        batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=0,
+        drop_last=False,
+        num_workers=cfg.training.num_workers,
         pin_memory=(device.type == "cuda"),
     )
     test_ld = DataLoader(
         test_ds,
-        batch_size=args.batch_size,
+        batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=0,
+        drop_last=False,
+        num_workers=cfg.training.num_workers,
         pin_memory=(device.type == "cuda"),
+    ) if test_ds is not None else None
+
+    seq_len = train_X.shape[1]
+    # layers resolve
+    if isinstance(cfg.architecture.layers, str) and cfg.architecture.layers.lower() == "auto":
+        n_layers = resolve_lstm_layers_auto(seq_len)
+    else:
+        n_layers = int(cfg.architecture.layers)
+
+    model = LSTMRootRegressor(
+        hidden=cfg.architecture.hidden_dim,
+        num_layers=n_layers,
+        dropout=cfg.architecture.dropout,
+        num_roots=cfg.model.num_roots,
+        arch=cfg.architecture,
+    ).to(device)
+
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.training.learning_rate,
+        weight_decay=cfg.training.weight_decay,
     )
 
-    print("[DATA]")
-    print("  train:", train_npz, "N=", len(train_ds))
-    print("  val  :", val_npz,   "N=", len(val_ds))
-    print("  test :", test_npz,  "N=", len(test_ds))
-    print("  keys :", train_ds.keys)
-    print("  target_root:", args.target_root, "use_extra_roots:", args.use_extra_roots)
-    X0, y0 = train_ds[0]
-    print("[SHAPE] X:", tuple(X0.shape), "y:", tuple(y0.shape))
+    ckpt_path = os.path.join(out_dir, "best.pt")
+    scaler_path = os.path.join(out_dir, "scaler.json")
+    cfg_dump_path = os.path.join(out_dir, "config_resolved.json")
 
-    model = LSTMRootRegressor(hidden=args.hidden, num_layers=args.layers, dropout=args.dropout).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-    loss_fn = nn.MSELoss()
+    with open(scaler_path, "w", encoding="utf-8") as f:
+        json.dump({"x_min": x_mn.tolist(), "x_max": x_mx.tolist()}, f, ensure_ascii=False, indent=2)
+
+    with open(cfg_dump_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "model": cfg.model.__dict__,
+            "architecture": cfg.architecture.__dict__,
+            "training": cfg.training.__dict__,
+            "loss": cfg.loss.__dict__,
+        }, f, ensure_ascii=False, indent=2)
+
+    print(f"[CONFIG] {cfg_path}")
+    print(f"[DATA] train={len(train_ds)} val={len(val_ds)} test={(len(test_ds) if test_ds else 0)}")
+    print(f"[NPZ] train coeff_key={train_ds_raw.coeff_key}, keys={train_ds_raw.keys}")
+    print(f"[SHAPE] seq_len(D)={seq_len}, num_roots={cfg.model.num_roots}")
+    print(f"[MODEL] hidden={cfg.architecture.hidden_dim}, layers={n_layers}, dropout={cfg.architecture.dropout}")
+    print(f"[OUT] {out_dir}")
 
     best_val = float("inf")
     patience = 0
 
-    for ep in range(1, args.epochs + 1):
+    for ep in range(1, cfg.training.epochs + 1):
         model.train()
         running = 0.0
+        steps = 0
 
-        for X, y in train_ld:
-            X = X.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
+        for xb in train_ld:
+            xb = xb.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            pred = model(X)
-            loss = loss_fn(pred, y)
+
+            roots = model(xb)  # (B,S)
+            loss = min_residual_loss(xb, roots, cfg.loss)
 
             if not torch.isfinite(loss):
                 continue
 
             loss.backward()
-            if args.grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            if cfg.training.grad_clip and cfg.training.grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
             opt.step()
 
             running += float(loss.item())
+            steps += 1
 
-        if ep % args.eval_every == 0:
-            val_metrics = evaluate(model, val_ld, device, tol=args.tol)
-            test_metrics = evaluate(model, test_ld, device, tol=args.tol)
+        if ep % max(cfg.training.eval_every, 1) == 0:
+            tr_loss = running / max(steps, 1)
+            val_loss = eval_epoch(model, val_ld, device, cfg.loss)
 
-            print(
-                f"[ep={ep:5d}] "
-                f"train_loss={running/max(len(train_ld),1):.6g} | "
-                f"val_mse={val_metrics['mse']:.6g} val_mae={val_metrics['mae']:.6g} val_hit={val_metrics['hit@tol']:.4f} | "
-                f"test_mse={test_metrics['mse']:.6g} test_mae={test_metrics['mae']:.6g} test_hit={test_metrics['hit@tol']:.4f}"
-            )
+            print(f"[ep={ep:4d}] train_loss={tr_loss:.6g}  val_loss={val_loss:.6g}")
 
-            if val_metrics["mse"] < best_val:
-                best_val = val_metrics["mse"]
+            if val_loss < best_val:
+                best_val = val_loss
                 patience = 0
                 torch.save(
                     {
-                        "model": model.state_dict(),
-                        "args": vars(args),
-                        "best_val_mse": best_val,
+                        "state_dict": model.state_dict(),
+                        "seq_len": seq_len,
+                        "num_roots": cfg.model.num_roots,
+                        "arch": cfg.architecture.__dict__,
+                        "loss": cfg.loss.__dict__,
+                        "scaler_json": scaler_path,
+                        "config_json": cfg_dump_path,
+                        "best_val": best_val,
                     },
-                    args.ckpt,
+                    ckpt_path,
                 )
-                print(f"  -> save best (val) to {args.ckpt}")
+                print(f"  -> save best: {ckpt_path}")
             else:
-                patience += 1
-                if patience >= args.early_stop:
-                    print("Early stop.")
-                    break
+                if cfg.training.early_stop and cfg.training.early_stop > 0:
+                    patience += 1
+                    if patience >= cfg.training.early_stop:
+                        print("[EARLY STOP]")
+                        break
 
-    print("Done.")
+    # test
+    if test_ld is not None and os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ck["state_dict"])
+        test_loss = eval_epoch(model, test_ld, device, cfg.loss)
+        print(f"[TEST] loss(min_residual)={test_loss:.6g}")
+
+    print("[DONE]")
 
 
-def build_argparser():
-    p = argparse.ArgumentParser()
+# -------------------------
+# Entrypoint (No argparse)
+# -------------------------
+def main() -> None:
+    import os
+    import torch
+    from src.path_utils import find_repo_root, resolve_repo_path, resolve_device
 
-    p.add_argument(
-        "--data_dir",
-        type=str,
-        default="/home/seokjun/math_12_3/taylor_data_physchem_v4_deg25",
-        help="Directory containing taylor_deg_{degree}_{train,val,test}.npz",
+    repo = find_repo_root(__file__)
+
+    default_cfg   = "configs/taylor_root_lstm.yaml"
+    default_train = "data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz"
+    default_val   = "data/taylor_data_physchem_v4_deg25/taylor_deg25_val.npz"
+    default_test  = "data/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz"
+    default_out   = "results/taylor_nn/lstm"
+    default_dev   = "auto"
+
+    cfg_path   = os.environ.get("TAYLOR_CFG", default_cfg)
+    train_npz  = os.environ.get("TRAIN_NPZ",  default_train)
+    val_npz    = os.environ.get("VAL_NPZ",    default_val)
+    test_npz   = os.environ.get("TEST_NPZ",   default_test)
+    out_dir    = os.environ.get("OUT_DIR",    default_out)
+    device_str = os.environ.get("DEVICE",     default_dev)
+
+    cfg_path_p  = resolve_repo_path(cfg_path, repo)
+    train_npz_p = resolve_repo_path(train_npz, repo)
+    val_npz_p   = resolve_repo_path(val_npz, repo)
+    test_npz_p  = resolve_repo_path(test_npz, repo)
+    out_dir_p   = resolve_repo_path(out_dir, repo)
+
+    device_str = resolve_device(device_str)
+
+    train_from_yaml(
+        cfg_path=str(cfg_path_p),
+        train_npz=str(train_npz_p),
+        val_npz=str(val_npz_p),
+        test_npz=(str(test_npz_p) if test_npz_p is not None else None),
+        out_dir=str(out_dir_p),
+        device_str=device_str,
     )
-    p.add_argument("--degree", type=int, default=25)
-
-    # dataset -> label
-    p.add_argument("--target_root", type=str, default="root0", choices=["root0", "root1", "root2"])
-    p.add_argument("--use_extra_roots", action="store_true",
-                   help="Append root1/root2 as extra sequence tokens to the coeff sequence.")
-    p.add_argument("--y_clip", type=float, default=1e6, help="Clip target y to [-y_clip, y_clip].")
-
-    # model
-    p.add_argument("--hidden", type=int, default=128)
-    p.add_argument("--layers", type=int, default=2)
-    p.add_argument("--dropout", type=float, default=0.0)
-
-    # train
-    p.add_argument("--batch_size", type=int, default=512)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--epochs", type=int, default=6000)
-    p.add_argument("--eval_every", type=int, default=5)
-    p.add_argument("--tol", type=float, default=1e-2)
-    p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--early_stop", type=int, default=6000)
-
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--ckpt", type=str, default="lstm_root_best_npz.pt")
-    return p
 
 
 if __name__ == "__main__":
-    args = build_argparser().parse_args()
-    train(args)
+    main()
