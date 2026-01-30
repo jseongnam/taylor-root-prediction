@@ -16,15 +16,15 @@ This repository provides a reproducible implementation for our Taylor-polynomial
 1) Create environment & install dependencies
 
 Option A — using requirements.txt
-
+```bash
 pip install -r requirements.txt
-
+```
 Option B — minimal install
-
+```bash
 pip install numpy torch tqdm pyyaml matplotlib pillow
 # optional (only if you enable symbolic solvers)
 pip install sympy requests
-
+```
 
 GPU is optional. If CUDA is unavailable, everything runs on CPU (slower).
 
@@ -42,7 +42,7 @@ show plots and failure distributions
 
 Open:
 
-notebooks/reviewer_demo_notebook_with_data_generation.ipynb
+notebooks/reviewer_demo_notebook_v3.ipynb
 
 Run from top to bottom.
 
@@ -89,14 +89,14 @@ data/taylor_data_physchem_v4_deg25/taylor_deg25_val.npz
 data/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz
 
 Run (example):
-
-python path/to/root_dataset_generator.py \
+```bash
+python scripts/data/generate_dataset_physchem_v4.py \
   --degree 25 \
   --n-total 20000 \
   --seed 42 \
   --out-dir data/taylor_data_physchem_v4_deg25 \
   --save-expr-str 1
-
+```
 B) Transformer interval dataset
 
 Expected outputs:
@@ -108,14 +108,14 @@ data/taylor_data_physchem_v4_interval/taylor_deg25_val.npz
 data/taylor_data_physchem_v4_interval/taylor_deg25_test.npz
 
 Run (example):
-
-python path/to/interval_dataset_generator.py \
+```bash
+python scripts/data/generate_interval_dataset_physchem_v4.py \
   --degree 25 \
   --n-total 20000 \
   --seed 42 \
   --out-dir data/taylor_data_physchem_v4_interval \
   --save-expr-str 1
-
+```
 
 Notes:
 
@@ -136,6 +136,7 @@ output directory via OUT_DIR
 device via DEVICE
 
 ANN
+```bash
 PYTHONPATH=. \
 TAYLOR_CFG=configs/taylor_root_ann.yaml \
 TRAIN_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz \
@@ -144,8 +145,9 @@ TEST_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz \
 OUT_DIR=results/taylor_nn/ann \
 DEVICE=cuda \
 python models/taylor_nn/ann.py
-
+```
 LSTM
+```bash
 PYTHONPATH=. \
 TAYLOR_CFG=configs/taylor_root_lstm.yaml \
 TRAIN_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz \
@@ -154,8 +156,9 @@ TEST_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz \
 OUT_DIR=results/taylor_nn/lstm \
 DEVICE=cuda \
 python models/taylor_nn/lstm.py
-
+```
 Anchored MLP
+```bash
 PYTHONPATH=. \
 TAYLOR_CFG=configs/taylor_root_mlp.yaml \
 TRAIN_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz \
@@ -164,8 +167,9 @@ TEST_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz \
 OUT_DIR=results/taylor_nn/mlp \
 DEVICE=cuda \
 python models/taylor_nn/mlp.py
-
+```
 Transformer interval predictor
+```bash
 PYTHONPATH=. \
 CFG_PATH=configs/transformer_interval.yaml \
 TRAIN_NPZ=data/taylor_data_physchem_v4_interval/taylor_deg25_train.npz \
@@ -175,17 +179,17 @@ OUT_DIR=results/transformer_interval \
 DEVICE=cuda \
 MODE=train \
 python models/transformer/model.py
-
+```
 6. Evaluation (K-sweep + Baseline + Plots + Failure Distribution)
 
 Evaluation is YAML-driven. Configure configs/eval_k_sweep.yaml and run:
-
+```bash
 PYTHONPATH=. \
 EVAL_CFG=configs/eval_k_sweep.yaml \
 OUTDIR=results/runs_k_sweep_viz \
 DEVICE=cuda \
 python evaluation/evaluate_k_sweep.py
-
+```
 Recommended flags via YAML (reviewer-friendly)
 
 threshold sweep
