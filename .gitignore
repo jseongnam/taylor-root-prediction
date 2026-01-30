@@ -4,7 +4,7 @@
 *.pth
 *.ckpt
 *.onnx
-
+*.json
 # numpy/pickle
 *.npy
 *.npz
