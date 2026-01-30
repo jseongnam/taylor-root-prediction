@@ -62,15 +62,18 @@ models/
   transformer/
     model.py
 
-evaluation/
-  evaluate_k_sweep.py
-
+scripts/
+  data/
+    generate_dataset_physchem_v4.py
+    generate_interval_dataset_physchem_v4.py
+  eval/
+    evaluate_k_sweep.py
 data/                       # (generated; not included by default)
   taylor_data_physchem_v4_deg25/
     taylor_deg25_{train,val,test}.npz
   taylor_data_physchem_v4_interval/
     taylor_deg25_{train,val,test}.npz
-
+  
 results/                    # outputs (generated)
 
 4. Dataset Generation (NPZ)
