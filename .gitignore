@@ -1,0 +1,12 @@
+# ===== datasets / checkpoints / artifacts =====
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# numpy/pickle
+*.npy
+*.npz
+*.pkl
+*.pickle
