@@ -92,10 +92,10 @@ reports:
 
   # --report-fail-funcid
   report_fail_funcid: true
-  report_fail_mode: baseline           # baseline | all
+  report_fail_mode: all           # baseline | all
   report_fail_funcid_topn: 30
   report_fail_expr_k: 3
-
+  report_fail_save: true
 plots:
   # --plot-residual-hist
   plot_residual_hist: true
