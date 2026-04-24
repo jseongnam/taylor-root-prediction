@@ -689,6 +689,9 @@ def _safe_torch_load(path: Path, map_location):
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=map_location)
+    except Exception:
+        return torch.load(path, map_location=map_location)
+
 
 def anchored_predict_z(model: nn.Module, X: torch.Tensor, anchors: Optional[np.ndarray]):
     y = model(X)
@@ -705,55 +708,89 @@ def anchored_predict_z(model: nn.Module, X: torch.Tensor, anchors: Optional[np.n
     z = (w * a).sum(dim=1, keepdim=True)
     return z
 
-def load_backend_anchored(ckpt_path: Path, device: torch.device):
-    obj = torch.load(ckpt_path, map_location=device)
-    cfg = {}
-    if isinstance(obj, dict) and ("model_state" in obj) and isinstance(obj["model_state"], dict):
-        sd = dict(obj["model_state"])
-        cfg = obj.get("config", {}) if isinstance(obj.get("config", {}), dict) else {}
-    elif isinstance(obj, dict):
-        sd = dict(obj)
-    else:
-        raise RuntimeError(f"[anchored] Unsupported checkpoint type: {type(obj)}")
-
-    def _to_np(x):
-        if x is None:
-            return None
-        if torch.is_tensor(x):
-            return x.detach().cpu().numpy().astype(np.float32)
-        return np.array(x, dtype=np.float32)
-
+def _extract_anchors(sd_or_obj):
     anchors = None
-    if "anchors" in sd:
-        anchors = _to_np(sd.pop("anchors", None))
-    if anchors is None and isinstance(cfg, dict) and ("anchors" in cfg):
-        anchors = _to_np(cfg.get("anchors"))
-    if anchors is None and isinstance(obj, dict) and ("anchors" in obj):
-        anchors = _to_np(obj.get("anchors"))
-    if anchors is not None:
-        anchors = np.array(anchors, dtype=np.float32).reshape(1, -1)
+    if isinstance(sd_or_obj, dict) and ("anchors" in sd_or_obj):
+        a = sd_or_obj["anchors"]
+        try:
+            if torch.is_tensor(a):
+                anchors = a.detach().cpu().numpy().astype(np.float32)
+            else:
+                anchors = np.array(a, dtype=np.float32)
+        except Exception:
+            anchors = None
+    return anchors
 
-    def _infer_prefix(sd_keys):
-        if any(k.startswith("net.") for k in sd_keys):
-            return "net"
-        for k in sd_keys:
-            m = re.match(r"^([A-Za-z0-9_]+)\.(\d+)\.weight$", k)
-            if m:
-                return m.group(1)
+def _infer_prefix_from_state_dict(sd: dict):
+    if any(k.startswith("net.") for k in sd.keys()):
         return "net"
-
-    prefix = _infer_prefix(sd.keys())
-
-    idxs = []
+    for cand in ("model.", "backbone.", "mlp.", "layers.", "seq."):
+        if any(k.startswith(cand) for k in sd.keys()):
+            return cand[:-1]
     for k in sd.keys():
-        m = re.match(rf"^{re.escape(prefix)}\.(\d+)\.weight$", k)
+        m = re.match(r"^([A-Za-z0-9_]+)\.\d+\.weight$", k)
         if m:
-            idxs.append(int(m.group(1)))
-    idxs = sorted(set(idxs))
-    if not idxs:
-        raise RuntimeError(f"[anchored] Cannot find linear layers under prefix '{prefix}.*.weight'")
+            return m.group(1)
+    return None
 
-    act_name = str(cfg.get("activation", "relu")).lower() if isinstance(cfg, dict) else "relu"
+def _collect_linear_keys_any(sd: dict):
+    groups = {}
+    for k, v in sd.items():
+        if (not torch.is_tensor(v)) or v.ndim != 2 or (not k.endswith(".weight")):
+            continue
+        prefix = k.rsplit(".", 2)[0]
+        groups.setdefault(prefix, []).append(k)
+    return groups
+
+def build_mlp_from_state_dict(sd, prefix=None, act_name="relu", dropout_p=0.0):
+    idxs = []
+
+    if prefix is not None:
+        for k in sd.keys():
+            m = re.match(rf"^{re.escape(prefix)}\.(\d+)\.weight$", k)
+            if m:
+                idxs.append(int(m.group(1)))
+        idxs = sorted(set(idxs))
+
+    if len(idxs) > 0:
+        if act_name in ("relu",):
+            Act = nn.ReLU
+        elif act_name in ("tanh",):
+            Act = nn.Tanh
+        elif act_name in ("gelu",):
+            Act = nn.GELU
+        elif act_name in ("leakyrelu", "leaky_relu"):
+            Act = lambda: nn.LeakyReLU(0.01)
+        else:
+            Act = nn.ReLU
+
+        layers = []
+        for i, li in enumerate(idxs):
+            w = sd[f"{prefix}.{li}.weight"]
+            if not torch.is_tensor(w):
+                w = torch.tensor(w)
+            out_dim, in_dim = int(w.shape[0]), int(w.shape[1])
+            has_bias = (f"{prefix}.{li}.bias" in sd)
+            layers.append((f"linear_{li}", nn.Linear(in_dim, out_dim, bias=has_bias)))
+            if i < len(idxs) - 1:
+                layers.append((f"act_{li}", Act()))
+                if float(dropout_p) > 0:
+                    layers.append((f"drop_{li}", nn.Dropout(p=float(dropout_p))))
+        model = nn.Sequential(OrderedDict(layers))
+        new_sd = {}
+        for li in idxs:
+            new_sd[f"linear_{li}.weight"] = sd[f"{prefix}.{li}.weight"]
+            b_key = f"{prefix}.{li}.bias"
+            if b_key in sd:
+                new_sd[f"linear_{li}.bias"] = sd[b_key]
+        return model, new_sd
+
+    groups = _collect_linear_keys_any(sd)
+    if not groups:
+        raise RuntimeError("[anchored] state_dict에서 선형층(weight ndim=2)을 찾지 못했습니다.")
+
+    best_prefix, best_keys = max(groups.items(), key=lambda kv: (len(kv[1]), kv[0]))
+    best_keys = sorted(best_keys)
     if act_name in ("relu",):
         Act = nn.ReLU
     elif act_name in ("tanh",):
@@ -765,6 +802,57 @@ def load_backend_anchored(ckpt_path: Path, device: torch.device):
     else:
         Act = nn.ReLU
 
+    layers = []
+    new_sd = {}
+    for i, w_key in enumerate(best_keys):
+        w = sd[w_key]
+        if not torch.is_tensor(w):
+            w = torch.tensor(w)
+        out_dim, in_dim = int(w.shape[0]), int(w.shape[1])
+        base = w_key[:-len(".weight")]
+        b_key = base + ".bias"
+        has_bias = b_key in sd
+        lname = f"linear_{i}"
+        layers.append((lname, nn.Linear(in_dim, out_dim, bias=has_bias)))
+        new_sd[f"{lname}.weight"] = sd[w_key]
+        if has_bias:
+            new_sd[f"{lname}.bias"] = sd[b_key]
+        if i < len(best_keys) - 1:
+            layers.append((f"act_{i}", Act()))
+            if float(dropout_p) > 0:
+                layers.append((f"drop_{i}", nn.Dropout(p=float(dropout_p))))
+    model = nn.Sequential(OrderedDict(layers))
+    return model, new_sd
+
+def load_backend_anchored(ckpt_path: Path, device: torch.device):
+    obj = _safe_torch_load(ckpt_path, map_location=device)
+    cfg = obj.get("config", {}) if isinstance(obj, dict) and isinstance(obj.get("config", {}), dict) else {}
+
+    if isinstance(obj, dict) and ("model_state" in obj) and isinstance(obj["model_state"], dict):
+        sd = dict(obj["model_state"])
+    elif isinstance(obj, dict) and ("state_dict" in obj) and isinstance(obj["state_dict"], dict):
+        sd = dict(obj["state_dict"])
+    elif isinstance(obj, dict):
+        sd = {k: v for k, v in obj.items() if torch.is_tensor(v)}
+        if not sd:
+            sd = dict(obj)
+    else:
+        raise RuntimeError(f"[anchored] Unsupported checkpoint type: {type(obj)}")
+
+    anchors = None
+    if isinstance(cfg, dict):
+        anchors = _extract_anchors(cfg)
+    if anchors is None and isinstance(obj, dict):
+        anchors = _extract_anchors(obj)
+    if anchors is None:
+        anchors = _extract_anchors(sd)
+
+    if "anchors" in sd:
+        sd.pop("anchors", None)
+
+    prefix = _infer_prefix_from_state_dict(sd)
+
+    act_name = str(cfg.get("activation", "relu")).lower() if isinstance(cfg, dict) else "relu"
     dropout_p = 0.0
     if isinstance(cfg, dict) and ("dropout" in cfg):
         try:
@@ -772,31 +860,126 @@ def load_backend_anchored(ckpt_path: Path, device: torch.device):
         except Exception:
             dropout_p = 0.0
 
-    layers = []
-    for i, li in enumerate(idxs):
-        W = sd[f"{prefix}.{li}.weight"]
-        if not torch.is_tensor(W):
-            W = torch.tensor(W)
-        out_dim, in_dim = int(W.shape[0]), int(W.shape[1])
-        has_bias = (f"{prefix}.{li}.bias" in sd)
-        layers.append((f"linear_{li}", nn.Linear(in_dim, out_dim, bias=has_bias)))
-        if i < len(idxs) - 1:
-            layers.append((f"act_{li}", Act()))
-            if dropout_p > 0:
-                layers.append((f"drop_{li}", nn.Dropout(p=dropout_p)))
-
-    model = nn.Sequential(OrderedDict(layers)).to(device)
-
-    new_sd = {}
-    for li in idxs:
-        new_sd[f"linear_{li}.weight"] = sd[f"{prefix}.{li}.weight"]
-        b_key = f"{prefix}.{li}.bias"
-        if b_key in sd:
-            new_sd[f"linear_{li}.bias"] = sd[b_key]
-    model.load_state_dict(new_sd, strict=False)
+    model, new_sd = build_mlp_from_state_dict(sd, prefix=prefix, act_name=act_name, dropout_p=dropout_p)
+    model = model.to(device)
+    missing, unexpected = model.load_state_dict(new_sd, strict=False)
+    if missing or unexpected:
+        print(f"[anchored] load_state_dict strict=False | missing={list(missing)} unexpected={list(unexpected)}")
     model.eval()
     scaler = None
     return model, anchors, scaler
+
+
+
+class ANNRootRegressor(nn.Module):
+    def __init__(self, in_dim: int, num_roots: int, arch_cfg: dict):
+        super().__init__()
+        hidden_dim = int(arch_cfg.get("hidden_dim", 25))
+        layers = arch_cfg.get("layers", "auto")
+        activation = str(arch_cfg.get("activation", "tanh")).lower()
+        dropout = float(arch_cfg.get("dropout", 0.0))
+        bounded_output = bool(arch_cfg.get("bounded_output", False))
+        root_range = float(arch_cfg.get("root_range", 10.0))
+
+        if isinstance(layers, str) and layers.lower() == "auto":
+            if in_dim <= 64:
+                hlist = [hidden_dim, hidden_dim, hidden_dim]
+            elif in_dim <= 256:
+                hlist = [hidden_dim] * 4
+            else:
+                hlist = [hidden_dim] * 5
+        elif isinstance(layers, int):
+            hlist = [hidden_dim] * int(layers)
+        elif isinstance(layers, (list, tuple)):
+            hlist = [int(x) for x in layers]
+        else:
+            hlist = [hidden_dim, hidden_dim, hidden_dim]
+
+        if activation == "tanh":
+            def make_act(): return nn.Tanh()
+        elif activation == "relu":
+            def make_act(): return nn.ReLU(inplace=True)
+        elif activation == "gelu":
+            def make_act(): return nn.GELU()
+        elif activation in ("silu", "swish"):
+            def make_act(): return nn.SiLU(inplace=True)
+        else:
+            def make_act(): return nn.Tanh()
+
+        mods = []
+        prev = in_dim
+        for h in hlist:
+            mods.append(nn.Linear(prev, h))
+            mods.append(make_act())
+            if dropout > 0:
+                mods.append(nn.Dropout(dropout))
+            prev = h
+
+        self.backbone = nn.Sequential(*mods) if mods else nn.Identity()
+        self.head = nn.Linear(prev, num_roots)
+        self.bounded_output = bounded_output
+        self.root_range = root_range
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.head(self.backbone(x))
+        if self.bounded_output:
+            y = torch.tanh(y) * float(self.root_range)
+        return y
+
+
+def _load_json_if_exists(p: Path):
+    try:
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_optional_json(base_path: Path, path_str: str, repo_root: Path):
+    s = str(path_str).strip()
+    if not s:
+        return None
+    p = Path(s)
+    if p.is_absolute() and p.exists():
+        return p
+    cands = [
+        (base_path.parent / p).resolve(),
+        (repo_root / p).resolve(),
+    ]
+    for c in cands:
+        if c.exists():
+            return c
+    return None
+
+
+def _extract_tensor_state_dict(obj):
+    if isinstance(obj, dict):
+        if "model" in obj and isinstance(obj["model"], dict):
+            if all(torch.is_tensor(v) for v in obj["model"].values()):
+                return dict(obj["model"]), "model"
+        if "state_dict" in obj and isinstance(obj["state_dict"], dict):
+            if all(torch.is_tensor(v) for v in obj["state_dict"].values()):
+                return dict(obj["state_dict"]), "state_dict"
+        if "model_state" in obj and isinstance(obj["model_state"], dict):
+            if all(torch.is_tensor(v) for v in obj["model_state"].values()):
+                return dict(obj["model_state"]), "model_state"
+        tensor_items = {k: v for k, v in obj.items() if torch.is_tensor(v)}
+        if tensor_items:
+            return tensor_items, "flat"
+    raise RuntimeError("ANN checkpoint에서 state_dict를 찾지 못했습니다.")
+
+
+def _infer_ann_kind(sd: dict):
+    keys = list(sd.keys())
+    if "fc1.weight" in sd and "fc2.weight" in sd:
+        return "shallow"
+    if any(k.startswith("backbone.") for k in keys) and any(k.startswith("head.") for k in keys):
+        return "modern"
+    if "head.weight" in sd:
+        return "modern"
+    return "shallow"
 
 class ShallowFNN(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden: int = 10):
@@ -806,50 +989,151 @@ class ShallowFNN(nn.Module):
         self.fc2 = nn.Linear(hidden, out_dim)
     def forward(self, x):
         return self.fc2(self.act(self.fc1(x)))
+def _build_shallow_ann_from_sd(sd: dict, device: torch.device):
+    if "fc1.weight" not in sd or "fc2.weight" not in sd:
+        raise RuntimeError("Shallow ANN state_dict에 fc1/fc2가 없습니다.")
+    in_dim = int(sd["fc1.weight"].shape[1])
+    hidden = int(sd["fc1.weight"].shape[0])
+    out_dim = int(sd["fc2.weight"].shape[0])
+    model = ShallowFNN(in_dim=in_dim, out_dim=out_dim, hidden=hidden).to(device)
+    model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model, in_dim, out_dim
 
+
+def _build_modern_ann_from_sd(sd: dict, ck: dict, repo_root: Path, ckpt_path: Path, device: torch.device):
+    cfg = {}
+    if isinstance(ck, dict) and isinstance(ck.get("config", None), dict):
+        cfg = ck["config"]
+
+    cfg_json_path = None
+    if isinstance(ck, dict):
+        cfg_json_path = _resolve_optional_json(ckpt_path, ck.get("config_json", ""), repo_root)
+    if cfg_json_path is not None:
+        loaded = _load_json_if_exists(cfg_json_path)
+        if isinstance(loaded, dict):
+            cfg = loaded
+
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    arch_cfg = cfg.get("architecture", {}) if isinstance(cfg, dict) else {}
+
+    # infer in_dim / num_roots if not present
+    if "head.weight" in sd:
+        num_roots = int(sd["head.weight"].shape[0])
+        prev_dim = int(sd["head.weight"].shape[1])
+    else:
+        last_linear_key = None
+        for k, v in sd.items():
+            if k.endswith(".weight") and torch.is_tensor(v) and v.ndim == 2:
+                last_linear_key = k
+        if last_linear_key is None:
+            raise RuntimeError("Modern ANN state_dict에서 마지막 linear weight를 찾지 못했습니다.")
+        num_roots = int(sd[last_linear_key].shape[0])
+        prev_dim = int(sd[last_linear_key].shape[1])
+
+    first_linear_key = None
+    for k, v in sd.items():
+        if k.endswith(".weight") and torch.is_tensor(v) and v.ndim == 2:
+            first_linear_key = k
+            break
+    if first_linear_key is None:
+        raise RuntimeError("Modern ANN state_dict에서 첫 linear weight를 찾지 못했습니다.")
+    inferred_in_dim = int(sd[first_linear_key].shape[1])
+
+    in_dim = int(ck.get("in_dim", model_cfg.get("input", {}).get("dimension", model_cfg.get("input", {}).get("order", inferred_in_dim - 1) + 1) if isinstance(model_cfg, dict) else inferred_in_dim))
+    num_roots = int(ck.get("num_roots", model_cfg.get("output", {}).get("num_roots", num_roots) if isinstance(model_cfg, dict) else num_roots))
+
+    # infer hidden/layers if config missing
+    if not arch_cfg:
+        hidden_guess = prev_dim
+        backbone_linears = []
+        for k, v in sd.items():
+            if k.startswith("backbone.") and k.endswith(".weight") and torch.is_tensor(v) and v.ndim == 2:
+                backbone_linears.append(k)
+        layers_guess = len(backbone_linears)
+        arch_cfg = {
+            "hidden_dim": hidden_guess,
+            "layers": max(1, layers_guess) if layers_guess > 0 else "auto",
+            "activation": "tanh",
+            "dropout": 0.0,
+            "bounded_output": False,
+            "root_range": 10.0,
+        }
+
+    model = ANNRootRegressor(in_dim=in_dim, num_roots=num_roots, arch_cfg=arch_cfg).to(device)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        print(f"[ann] load_state_dict strict=False | missing={list(missing)} unexpected={list(unexpected)}")
+    model.eval()
+    return model, in_dim, num_roots
+
+
+def load_backend_ann_mdpi(ckpt_path: Path, device: torch.device, repo_root: Path):
+    ck = _safe_torch_load(ckpt_path, map_location=device)
+
+    if isinstance(ck, dict) and "model" in ck and isinstance(ck["model"], dict) and "in_dim" in ck and "out_dim" in ck:
+        model = ShallowFNN(
+            in_dim=int(ck["in_dim"]),
+            out_dim=int(ck["out_dim"]),
+            hidden=int(ck.get("hidden", 10)),
+        ).to(device)
+        model.load_state_dict(ck["model"], strict=False)
+        model.eval()
+    else:
+        sd, _src = _extract_tensor_state_dict(ck)
+        kind = _infer_ann_kind(sd)
+        if kind == "shallow":
+            model, in_dim, out_dim = _build_shallow_ann_from_sd(sd, device=device)
+        else:
+            model, in_dim, out_dim = _build_modern_ann_from_sd(
+                sd, ck if isinstance(ck, dict) else {}, repo_root, ckpt_path, device=device
+            )
+
+    scaler_path = ""
+    if isinstance(ck, dict):
+        scaler_path = str(ck.get("scaler_json", "")).strip()
+
+    spath = None
+    if scaler_path:
+        spath = _resolve_optional_json(ckpt_path, scaler_path, repo_root)
+
+    if spath is None:
+        for cand in [
+            ckpt_path.parent / "scaler.json",
+            ckpt_path.parent / "scaler_minmax.json",
+            ckpt_path.parent / "config_resolved.json",
+        ]:
+            if cand.exists():
+                spath = cand
+                break
+
+    if spath is None or (not spath.exists()):
+        raise RuntimeError(f"ANN scaler_json not found near checkpoint: {ckpt_path}")
+
+    sc = _load_json_if_exists(spath)
+    if not isinstance(sc, dict) or ("x_min" not in sc) or ("x_max" not in sc):
+        raise RuntimeError(f"ANN scaler file invalid or missing x_min/x_max: {spath}")
+
+    x_min = torch.tensor(sc["x_min"], dtype=torch.float32, device=device)
+    x_max = torch.tensor(sc["x_max"], dtype=torch.float32, device=device)
+
+    y_min = None
+    y_max = None
+    if ("y_min" in sc) and ("y_max" in sc):
+        y_min = torch.tensor(sc["y_min"], dtype=torch.float32, device=device)
+        y_max = torch.tensor(sc["y_max"], dtype=torch.float32, device=device)
+    else:
+        print(f"[ann] scaler without y_min/y_max -> output is treated as already original scale: {spath}")
+
+    return model, (x_min, x_max, y_min, y_max)
 def _minmax_to_minus1_1_torch(x: torch.Tensor, mn: torch.Tensor, mx: torch.Tensor, eps: float = 1e-12):
     den = torch.clamp(mx - mn, min=eps)
     return (2.0 * (x - mn) / den - 1.0)
 
-def _inv_minmax_from_minus1_1_torch(x_scaled: torch.Tensor, mn: torch.Tensor, mx: torch.Tensor):
+def _inv_minmax_from_minus1_1_torch(x_scaled: torch.Tensor, mn: Optional[torch.Tensor], mx: Optional[torch.Tensor]):
+    if mn is None or mx is None:
+        return x_scaled
     return ((x_scaled + 1.0) * 0.5 * (mx - mn) + mn)
-
-def load_backend_ann_mdpi(ckpt_path: Path, device: torch.device, repo_root: Path):
-    ck = _safe_torch_load(ckpt_path, map_location=device)
-    if not isinstance(ck, dict) or "model" not in ck:
-        raise RuntimeError("ANN ckpt must be dict with key 'model'")
-    in_dim = int(ck["in_dim"])
-    out_dim = int(ck["out_dim"])
-    hidden = int(ck.get("hidden", 10))
-    model = ShallowFNN(in_dim=in_dim, out_dim=out_dim, hidden=hidden).to(device)
-    model.load_state_dict(ck["model"])
-    model.eval()
-
-    scaler_path = str(ck.get("scaler_json", "")).strip()
-    if not scaler_path:
-        raise RuntimeError("ANN ckpt missing scaler_json(path)")
-    spath = Path(scaler_path)
-    if not spath.is_absolute():
-        cand = [(ckpt_path.parent / spath), (repo_root / spath)]
-        found = None
-        for c in cand:
-            if c.exists():
-                found = c
-                break
-        if found is None:
-            raise RuntimeError(f"ANN scaler_json not found: {spath}")
-        spath = found
-    if not spath.exists():
-        raise RuntimeError(f"ANN scaler_json not found: {spath}")
-
-    with open(spath, "r", encoding="utf-8") as f:
-        sc = json.load(f)
-    x_min = torch.tensor(sc["x_min"], dtype=torch.float32, device=device)
-    x_max = torch.tensor(sc["x_max"], dtype=torch.float32, device=device)
-    y_min = torch.tensor(sc["y_min"], dtype=torch.float32, device=device)
-    y_max = torch.tensor(sc["y_max"], dtype=torch.float32, device=device)
-    return model, (x_min, x_max, y_min, y_max)
-
 def ann_predict_z(model: nn.Module, X: torch.Tensor, scalers):
     x_min, x_max, y_min, y_max = scalers
     x_scaled = _minmax_to_minus1_1_torch(X, x_min, x_max)
@@ -859,7 +1143,15 @@ def ann_predict_z(model: nn.Module, X: torch.Tensor, scalers):
     return y_org[:, 0:1]
 
 class LSTMRootRegressor(nn.Module):
-    def __init__(self, hidden: int = 128, num_layers: int = 2, dropout: float = 0.0):
+    def __init__(
+        self,
+        hidden: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.0,
+        num_roots: int = 1,
+        bounded_output: bool = False,
+        root_range: float = 10.0,
+    ):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=1,
@@ -871,30 +1163,112 @@ class LSTMRootRegressor(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.Tanh(),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, int(num_roots)),
         )
+        self.bounded_output = bool(bounded_output)
+        self.root_range = float(root_range)
+
     def forward(self, x):
         _, (h_n, _) = self.lstm(x)
-        return self.head(h_n[-1])
-
+        y = self.head(h_n[-1])
+        if self.bounded_output:
+            y = torch.tanh(y) * self.root_range
+        return y
+def _extract_lstm_state_dict(ck):
+    if isinstance(ck, dict):
+        for key in ("model", "state_dict", "model_state"):
+            if key in ck and isinstance(ck[key], dict):
+                if all(torch.is_tensor(v) for v in ck[key].values()):
+                    return dict(ck[key]), key
+        tensor_items = {k: v for k, v in ck.items() if torch.is_tensor(v)}
+        if tensor_items:
+            return tensor_items, "flat"
+    raise RuntimeError("LSTM checkpoint에서 state_dict를 찾지 못했습니다.")
 def load_backend_lstm(ckpt_path: Path, device: torch.device):
     ck = _safe_torch_load(ckpt_path, map_location=device)
-    if not isinstance(ck, dict) or "model" not in ck:
-        raise RuntimeError("LSTM ckpt must be dict with key 'model'")
-    args = ck.get("args", {})
-    hidden = int(args.get("hidden", 128))
-    layers = int(args.get("layers", 2))
-    dropout = float(args.get("dropout", 0.0))
-    model = LSTMRootRegressor(hidden=hidden, num_layers=layers, dropout=dropout).to(device)
-    model.load_state_dict(ck["model"])
+    sd, src_kind = _extract_lstm_state_dict(ck)
+
+    cfg = ck.get("config", {}) if isinstance(ck, dict) and isinstance(ck.get("config", {}), dict) else {}
+
+    config_json_path = None
+    if isinstance(ck, dict):
+        config_json_path = _resolve_optional_json(
+            ckpt_path,
+            ck.get("config_json", ""),
+            find_repo_root(ckpt_path),
+        )
+    if config_json_path is not None:
+        loaded = _load_json_if_exists(config_json_path)
+        if isinstance(loaded, dict):
+            cfg = loaded
+
+    layer_ids = set()
+    for k in sd.keys():
+        m = re.match(r"lstm\.weight_ih_l(\d+)$", k)
+        if m:
+            layer_ids.add(int(m.group(1)))
+    inferred_layers = max(layer_ids) + 1 if layer_ids else 2
+
+    hidden = int(sd["lstm.weight_ih_l0"].shape[0] // 4) if "lstm.weight_ih_l0" in sd else 128
+    dropout = 0.0
+    num_roots = 1
+    bounded_output = False
+    root_range = 10.0
+
+    if isinstance(cfg, dict):
+        arch = cfg.get("architecture", {}) if isinstance(cfg.get("architecture", {}), dict) else {}
+        model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model", {}), dict) else {}
+
+        if "hidden_dim" in arch:
+            hidden = int(arch["hidden_dim"])
+
+        layers_raw = arch.get("layers", inferred_layers)
+        if isinstance(layers_raw, str) and layers_raw.strip().lower() == "auto":
+            layers = inferred_layers
+        else:
+            layers = int(layers_raw)
+
+        dropout = float(arch.get("dropout", 0.0))
+        bounded_output = bool(arch.get("bounded_output", False))
+        root_range = float(arch.get("root_range", 10.0))
+
+        if isinstance(model_cfg, dict) and ("num_roots" in model_cfg):
+            num_roots = int(model_cfg["num_roots"])
+        elif isinstance(model_cfg.get("output", {}), dict) and ("num_roots" in model_cfg["output"]):
+            num_roots = int(model_cfg["output"]["num_roots"])
+        elif isinstance(ck, dict) and ("num_roots" in ck):
+            num_roots = int(ck["num_roots"])
+        elif "head.2.weight" in sd:
+            num_roots = int(sd["head.2.weight"].shape[0])
+        elif "head.weight" in sd:
+            num_roots = int(sd["head.weight"].shape[0])
+    else:
+        layers = inferred_layers
+        if "head.2.weight" in sd:
+            num_roots = int(sd["head.2.weight"].shape[0])
+
+    model = LSTMRootRegressor(
+        hidden=hidden,
+        num_layers=layers,
+        dropout=dropout,
+        num_roots=num_roots,
+        bounded_output=bounded_output,
+        root_range=root_range,
+    ).to(device)
+
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        print(f"[lstm] load_state_dict strict=False | missing={list(missing)} unexpected={list(unexpected)} | src={src_kind}")
+
     model.eval()
     return model
+
 
 def lstm_predict_z(model: nn.Module, X: torch.Tensor):
     x_seq = X.unsqueeze(-1)
     with torch.no_grad():
         z = model(x_seq)
-    return z
+    return z[:, 0:1] if z.dim() == 2 else z
 
 
 # =========================================================
@@ -1885,7 +2259,50 @@ def main():
     N, D = coeffs.shape
     func_id = data["func_id"] if ("func_id" in data and data["func_id"].shape[0] == N) else None
     print(f"[NPZ] N={N} degree={D-1} has_func_id={func_id is not None}")
+    test_npz = str(_get(cfg, "data.test_npz", "data/taylor_test_physchem_v3_allroots_10000.npz"))
+    test_path = resolve_repo_path(test_npz, repo)
+    if not test_path.exists():
+        raise FileNotFoundError(f"test_npz not found: {test_path}")
+    if test_path.is_dir():
+        raise IsADirectoryError(f"test_npz is a directory, not a file: {test_path}")
 
+    eval_degree = _get(cfg, "data.eval_degree", None)
+    env_eval_degree = os.environ.get("EVAL_DEGREE", "").strip()
+    if env_eval_degree:
+        eval_degree = int(env_eval_degree)
+    elif eval_degree is not None:
+        eval_degree = int(eval_degree)
+
+    data = np.load(test_path, allow_pickle=True)
+
+    raw_coeffs = data["coeffs"].astype(np.float32)
+    if raw_coeffs.ndim != 2:
+        raise ValueError(f"coeffs must be 2D, got shape={raw_coeffs.shape}")
+
+    raw_D = raw_coeffs.shape[1]
+
+    if eval_degree is None:
+        coeffs = raw_coeffs
+    else:
+        need_dim = int(eval_degree) + 1
+        if raw_D < need_dim:
+            raise ValueError(
+                f"master coeff dim too small: raw_dim={raw_D}, need={need_dim} for eval_degree={eval_degree}"
+            )
+        coeffs = raw_coeffs[:, :need_dim].copy()
+
+    if "func_expr" in data:
+        expr = data["func_expr"]
+    elif "expr_str" in data:
+        expr = data["expr_str"]
+    else:
+        raise KeyError("NPZ must contain 'func_expr' or 'expr_str'.")
+
+    N, D = coeffs.shape
+    func_id = data["func_id"] if ("func_id" in data and data["func_id"].shape[0] == N) else None
+
+    print(f"[NPZ] path={test_path}")
+    print(f"[NPZ] raw_degree={raw_D - 1} eval_degree={D - 1} has_func_id={func_id is not None}")
     if (ast_ckpt is None) or (not ast_ckpt.exists()):
         raise FileNotFoundError(f"AST ckpt not found: {ast_ckpt}")
 
@@ -1922,7 +2339,22 @@ def main():
         m = load_backend_lstm(lstm_ckpt, device=device)
         backends.append(("lstm", {"type": "lstm", "model": m}))
         print(f"[lstm] {lstm_ckpt}")
+    expected_in_dim = coeffs.shape[1]
 
+    def _infer_first_linear_in_dim(model: nn.Module):
+        for m in model.modules():
+            if isinstance(m, nn.Linear):
+                return int(m.in_features)
+        return None
+
+    for bname, pack in backends:
+        if pack["type"] in ("anchored", "ann"):
+            in_dim = _infer_first_linear_in_dim(pack["model"])
+            if in_dim is not None and in_dim != expected_in_dim:
+                raise ValueError(
+                    f"[{bname}] input dim mismatch: model expects {in_dim}, "
+                    f"but test coeff dim is {expected_in_dim}"
+            )
     if not backends:
         raise RuntimeError("No backend checkpoints found. Set models.*_ckpt in YAML to existing files.")
 

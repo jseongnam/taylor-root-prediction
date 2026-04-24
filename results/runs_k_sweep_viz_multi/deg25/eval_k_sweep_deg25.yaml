@@ -1,0 +1,56 @@
+outdir: runs_k_sweep_viz
+device: auto
+batch_size: 256
+data:
+  data_dir: /home/seokjun/taylor-root-prediction
+  test_npz: /home/seokjun/taylor-root-prediction/data/test_multi_truncated/taylor_test_physchem_v3_allroots_deg25_to_deg25_10000.npz
+models:
+  ast_ckpt: /home/seokjun/math_12_3/expr_center_ast_best_50.pt
+  anchored_ckpt: /home/seokjun/taylor-root-prediction/results/taylor_nn/mlp/deg25/best.pt
+  ann_ckpt: /home/seokjun/taylor-root-prediction/results/taylor_nn/ann/deg25/best.pt
+  lstm_ckpt: /home/seokjun/taylor-root-prediction/results/taylor_nn/lstm/deg25/best.pt
+k_sweep:
+  topk_list: 5,10,15,20,25,30
+thresholds:
+  compare_thr: 1.0e-10
+  thr_sweep: 1e-6,1e-8,1e-10,1e-12
+solver:
+  proxy: poly
+  max_tries: 10
+  stop_after_first_success: false
+  solver_mode: newton_bisect
+  tol_f: 1.0e-10
+  newton_iters: 30
+  newton_max_step: 2.0
+  bisect_iters: 60
+  local_radius: 1.0
+  local_scan_n: 101
+  local_max_brackets: 10
+  stable_radius: 1.0
+  stable_scan_n: 80
+  stable_valid_min: 0.7
+  stable_dfx_min: 1.0e-10
+baseline:
+  mode: all
+  scan_xmin: -20.0
+  scan_xmax: 20.0
+  scan_n: 250
+  topk: 10
+  anchored_fb: auto
+reports:
+  thr_winner_okonly: true
+  report_funcid_winner: true
+  report_funcid_winner_mode: both
+  report_funcid_winner_expr_k: 3
+  report_funcid_winner_topn: 50
+  report_fail_funcid: true
+  report_fail_mode: all
+  report_fail_funcid_topn: 30
+  report_fail_expr_k: 3
+  report_fail_save: true
+plots:
+  plot_residual_hist: true
+  plot_funcid_box: true
+  plot_topn_funcid: 15
+runtime:
+  suppress_runtime_warnings: false

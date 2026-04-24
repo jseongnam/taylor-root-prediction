@@ -891,7 +891,7 @@ def main() -> None:
 
     cfg = load_yaml(cfg_path)
 
-    degree = int(get(cfg, "dataset.degree", 25))
+    degree = int(get(cfg, "dataset.degree", 50))
     n_total = int(get(cfg, "dataset.n_total", 10000))
     seed = int(get(cfg, "dataset.seed", 0))
 
@@ -914,7 +914,7 @@ def main() -> None:
     if roots_scope not in ("all_domains", "chosen_domain"):
         raise ValueError("roots.scope must be 'all_domains' or 'chosen_domain'")
 
-    max_roots = int(get(cfg, "roots.max_roots", 25))
+    max_roots = int(get(cfg, "roots.max_roots", 50))
     choose_policy = str(get(cfg, "roots.choose_policy", "most_roots_then_width")).strip()
     if choose_policy not in ("most_roots_then_width", "first"):
         raise ValueError("roots.choose_policy must be 'most_roots_then_width' or 'first'")

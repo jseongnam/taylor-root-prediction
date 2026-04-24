@@ -1,0 +1,6 @@
+K,ssl_ok_rate,baseline_ok_rate,ssl_only,baseline_only,both_ok,both_fail,ssl_better_among_both_ok,baseline_better_among_both_ok,elapsed_sec,case_csv
+5,0.0,0.8409,0,8409,0,1591,0,0,17.173691575000703,/home/seokjun/taylor-root-prediction/results/runs_baseline_vs_ssl/compare_cases_K5.csv
+10,0.0,0.8409,0,8409,0,1591,0,0,21.501218865996634,/home/seokjun/taylor-root-prediction/results/runs_baseline_vs_ssl/compare_cases_K10.csv
+15,0.0,0.8409,0,8409,0,1591,0,0,28.165880022999772,/home/seokjun/taylor-root-prediction/results/runs_baseline_vs_ssl/compare_cases_K15.csv
+20,0.0,0.8409,0,8409,0,1591,0,0,35.07852393900248,/home/seokjun/taylor-root-prediction/results/runs_baseline_vs_ssl/compare_cases_K20.csv
+25,0.0,0.8409,0,8409,0,1591,0,0,42.03008017999673,/home/seokjun/taylor-root-prediction/results/runs_baseline_vs_ssl/compare_cases_K25.csv

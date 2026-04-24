@@ -1,0 +1,15 @@
+[CFG] repo_root=/home/seokjun/taylor-root-prediction
+[CFG] cfg=/home/seokjun/taylor-root-prediction/configs/eval_k_sweep.yaml
+[CFG] outdir=/home/seokjun/taylor-root-prediction/results/deg10/runs_k_sweep_viz
+[CFG] device=cuda batch=256 K_list=[5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+[CFG] test_npz=/home/seokjun/taylor-root-prediction/v6/taylor_test_physchem_v3_allroots_10000_deg10.npz
+[CFG] compare_thr=1.0e-10 thr_list=[1e-06, 1e-08, 1e-10, 1e-12]
+[CFG] solver_mode=newton_bisect baseline_mode=all anchored_fb=auto
+Traceback (most recent call last):
+  File "/home/seokjun/taylor-root-prediction/scripts/eval/evaluate_k_sweep.py", line 1947, in <module>
+    main()
+  File "/home/seokjun/taylor-root-prediction/scripts/eval/evaluate_k_sweep.py", line 1875, in main
+    data = np.load(test_path, allow_pickle=True)
+  File "/home/seokjun/miniconda3/envs/action_recognition/lib/python3.10/site-packages/numpy/lib/npyio.py", line 427, in load
+    fid = stack.enter_context(open(os_fspath(file), "rb"))
+IsADirectoryError: [Errno 21] Is a directory: '/home/seokjun/taylor-root-prediction/v6/taylor_test_physchem_v3_allroots_10000_deg10.npz'

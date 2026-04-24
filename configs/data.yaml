@@ -4,7 +4,7 @@ data:
     shift_interval_width: 1.0
 
   taylor:
-    order: 25
+    order: 50
     expansion: maclaurin
     pad_to_order: true
 

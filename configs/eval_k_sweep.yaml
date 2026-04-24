@@ -7,8 +7,8 @@ device: auto          # auto | cuda | cpu
 batch_size: 256
 
 data:
-  data_dir: /home/seokjun/math_12_3
-  test_npz: v6/taylor_test_physchem_v3_allroots_10000.npz
+  data_dir: /home/seokjun/taylor-root-prediction
+  test_npz: data/test_multi/taylor_test_physchem_v3_allroots_deg25_10000.npz
   # test_npz 내부 key:
   #   - coeffs: (N, degree+1)
   #   - func_expr or expr_str: (N,)
@@ -17,12 +17,12 @@ data:
 
 models:
   ast_ckpt: /home/seokjun/math_12_3/expr_center_ast_best_50.pt
-  anchored_ckpt: /home/seokjun/math_12_3/taylor_data_physchem_v4_deg25/v4_expect25_deg25_mlp_hd25_best_fx_mse.pt
-  ann_ckpt: /home/seokjun/math_12_3/mdpi_fnn_best.pt
-  lstm_ckpt: /home/seokjun/math_12_3/lstm_root_best_npz.pt
+  anchored_ckpt: /home/seokjun/taylor-root-prediction/results/taylor_nn/ann/deg15/best.pt
+  ann_ckpt: /home/seokjun/taylor-root-prediction/results/taylor_nn/mlp/deg15/best.pt
+  lstm_ckpt: /home/seokjun/taylor-root-prediction/results/taylor_nn/lstm/deg15/best.pt
 
 k_sweep:
-  topk_list: "5,10,15,20,25,30,35,40,45,50"
+  topk_list: "5,10,15,20,25,30"
 
 thresholds:
   compare_thr: 1.0e-10

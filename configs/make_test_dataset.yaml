@@ -1,15 +1,10 @@
-# configs/make_test_dataset.yaml
 dataset:
-  name: taylor_test_physchem_v3_allroots
-  degree: 25
+  max_degree: 50
+  degree_list: [50]
   n_total: 10000
   seed: 0
-
-  # global x range (role에 따라 내부에서 자동 clip될 수 있음)
   x_min: -1000.0
   x_max: 1000.0
-
-  # roots extraction (numpy.roots)
   imag_tol: 1e-8
   merge_tol: 1e-6
   in_eps: 0.0
@@ -22,10 +17,9 @@ domains:
   max_domains_keep: 6
 
 roots:
-  scope: all_domains        # all_domains | chosen_domain
-  max_roots: 25             # root0_all/root1_all padding length
-  choose_policy: most_roots_then_width  # most_roots_then_width | first
+  scope: all_domains
+  max_roots: 25
+  choose_policy: most_roots_then_width
 
 output:
-  # repo root 기준 상대경로
-  npz_path: data/test/v6/taylor_test_physchem_v3_allroots_10000.npz
+  npz_path: data/test/taylor_test_physchem_v3_allroots_maxdeg50_10000.npz

@@ -1,0 +1,39 @@
+data:
+  test_npz: data/test_multi/taylor_test_physchem_v3_allroots_deg25_10000.npz
+
+models:
+  ast_ckpt: /home/seokjun/math_12_3/expr_center_ast_best_50.pt
+  ssl_ckpt: /home/seokjun/taylor-root-prediction/results/taylor_nn/residual_ssl/best.pt
+
+eval:
+  device: auto
+  batch_size: 512
+  topk_list: 5,10,15,20,25
+  compare_thr: 1
+  thr_sweep: 1,1e-1,1e-2,1e-3
+
+solver:
+  solver_mode: newton_bisect
+  max_tries: 10
+  stop_after_first_success: false
+  proxy: poly
+  tol_f: 1
+  newton_iters: 30
+  newton_max_step: 2.0
+  bisect_iters: 60
+  local_radius: 1.0
+  local_scan_n: 101
+  local_max_brackets: 10
+  stable_radius: 1.0
+  stable_scan_n: 80
+  stable_valid_min: 0.7
+  stable_dfx_min: 1e-10
+
+baseline:
+  mode: all
+  topk: 10
+  scan_xmin: -20.0
+  scan_xmax: 20.0
+  scan_n: 250
+  cache: results/cache/baseline_cache.npz
+  cache_save: true

@@ -1,0 +1,9 @@
+func_id,family,n_fail,n_all,failure_rate,mechanism,short_reason
+10,Arrhenius-like,158,406,0.3891625615763547,radius-limited / nearby singularity,singularity near x=-1 restricts local Maclaurin validity
+0,Damped oscillator 1,142,1397,0.10164638511095204,oscillation + damping / phase drift,repeated oscillatory roots become misaligned far from center
+11,Diode I-V,188,642,0.29283489096573206,steep exponential growth / coefficient explosion,rapid exponential growth amplifies residual mismatch
+9,Activation + logarithmic term,86,366,0.23497267759562843,nonuniform local sensitivity / logarithmic boundary effect,log-shaped local sensitivity causes asymmetric mismatch
+1,Damped oscillator 2,25,1544,0.016191709844559584,mixed oscillatory interference,multiple oscillatory components produce unstable local matching
+5,Damped sine current,360,1229,0.29292107404393813,oscillation + damping / phase drift,many repeated roots with damping accumulate phase error
+12,Damped wave,322,1235,0.26072874493927123,oscillation + damping / phase drift,damped wave roots drift under truncated local representation
+6,Heat fin,185,745,0.2483221476510067,global shape mismatch / curvature loss,global curvature is not preserved well by fixed local truncation

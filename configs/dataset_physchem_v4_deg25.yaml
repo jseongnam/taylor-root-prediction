@@ -1,6 +1,6 @@
 dataset:
   version: physchem_v4
-  degree: 25
+  degree: 40
   n_total: 1000000
   seed: 42
   out_dir: "./taylor_data_physchem_v4_deg25"

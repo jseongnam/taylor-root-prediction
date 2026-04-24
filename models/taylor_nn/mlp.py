@@ -306,7 +306,7 @@ class MLPAnchoredRoot(nn.Module):
         temperature: float = 1.0,
     ):
         super().__init__()
-        assert m == 25, "요구사항: output layer 차원은 25로 고정."
+        # assert m == 25, "요구사항: output layer 차원은 25로 고정."
         self.in_dim = in_dim
         self.hidden_dim = hidden_dim
         self.m = m
