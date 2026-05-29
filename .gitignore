@@ -1,12 +1,25 @@
-# ===== datasets / checkpoints / artifacts =====
-*.npz
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+.venv/
+venv/
+.env
+
 *.pt
 *.pth
 *.ckpt
-*.onnx
-*.json
-# numpy/pickle
-*.npy
 *.npz
-*.pkl
-*.pickle
+*.npy
+*.zip
+*.tar.gz
+
+data/*
+!data/README.md
+
+checkpoints/*
+!checkpoints/README.md
+
+outputs/
+runs/
+wandb/

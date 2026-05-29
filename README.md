@@ -1,98 +1,227 @@
-# Taylor Root Prediction (IEEE Access / Reproducibility Package)
+# Taylor Root Prediction
 
-This repository provides a reproducible implementation for our Taylor-polynomial-based root prediction framework:
-- **Transformer interval predictor** (AST-tokenized expression → top-k interval centers)
-- **Taylor-root regressors** (shifted Taylor coefficients → predicted root offset)
-  - ANN (MDPI-style shallow FNN)
-  - LSTM baseline
-  - Anchored MLP (Expectation residual over anchors)
-- **Baseline solver** (scan + bracket + bisection + post-check)
-- **Evaluation**: K-sweep, winner analysis, threshold sweep, fail concentration by function/template, plots
+Official implementation of the IEEE Access paper:
 
-> ✅ All paths are **relative to the repository root** so that reviewers can run after `git clone` without editing absolute paths.
+**A Root Prediction System for Single-Variable Equations with Existing Taylor Polynomials**  
+Seokjun Jeong and Yoosoo Oh  
+IEEE Access, Early Access, 2026  
+DOI: [10.1109/ACCESS.2026.3697368](https://doi.org/10.1109/ACCESS.2026.3697368)
 
-1. Quick Start (Reviewer)
+This repository provides a reproducible implementation of a neural-numerical root prediction framework that combines:
 
-1) Create environment & install dependencies
+- Transformer-based interval localization
+- 25th-order shifted Maclaurin/Taylor representations
+- coefficient-based neural root regression
+- multi-candidate root prediction
+- residual, domain, and derivative-stability validation
+- baseline numerical solver comparison
+- K-sweep and failure-concentration analysis
 
-Option A — using requirements.txt
-```bash
+The goal of this work is not to blindly replace numerical validation with neural prediction.  
+Instead, the framework reformulates nonlinear root finding as a structured prediction problem while preserving numerical reliability through strict residual-based post-checks.
+
+---
+
+## Research Motivation
+
+Classical root-finding methods such as Newton-Raphson, bisection, and secant methods are powerful and widely used, but their practical behavior can be sensitive to initialization, derivative behavior, ill-conditioning, and basin-of-attraction structure.
+
+This work explores a neural-numerical alternative. Instead of manually selecting a single initial point, the proposed system first localizes candidate root-containing intervals using a Transformer, constructs local Taylor representations around the selected centers, predicts multiple candidate roots, and finally validates the candidates using strict numerical checks.
+
+The central principle of this repository is:
+
+> Neural models should assist numerical solving through localization, prediction, or correction, while residual-based validation preserves numerical reliability.
+
+---
+
+## Method Overview
+
+The proposed framework consists of four main stages.
+
+### 1. Transformer-Based Interval Localization
+
+The input equation is tokenized as a symbolic sequence.  
+A Transformer encoder processes the expression and predicts top-k candidate interval centers that are likely to contain real roots.
+
+In the final operating point used in the paper, the system uses:
+
+```text
+top-k = 25 candidate intervals
+```
+
+
+---
+### 2. Shifted Local Taylor Representation
+
+For each predicted candidate center, the variable is shifted so that the function can be approximated locally by a Maclaurin expansion.
+
+The shifted function is expanded up to the 25th order:
+```text
+N = 25
+```
+This produces a compact coefficient vector that represents local function behavior near the candidate center.
+
+
+---
+### 3. Coefficient-Based Multi-Candidate Root Regression
+
+The Taylor coefficient vector is passed to neural regression models that predict multiple candidate roots.
+
+Implemented regression backbones include:
+
+- ANN
+- LSTM
+- MLP / anchored MLP variant
+
+The regressors are treated as alternative backbones inside the same root-prediction framework.
+
+---
+### 4. Residual-Based Selection and Validation
+
+Predicted candidate roots are evaluated using the original function.
+
+A candidate is accepted only if it satisfies the numerical validation protocol:
+```text
+|f(r)| < 1e-10
+```
+Additional checks include:
+
+- domain constraint validation
+- derivative-based stability checking
+- residual-based candidate ranking
+- post-check against the original equation
+
+## Key Contributions
+
+This repository implements the following research components:
+
+- Reformulation of single-variable nonlinear root finding as a structured neural prediction problem.
+- Transformer-based interval localization for identifying candidate root-containing regions.
+- Local Taylor/Maclaurin coefficient representation after variable shifting.
+- Coefficient-based neural regression for multi-candidate root prediction.
+- Strict residual-based validation instead of direct trust in raw neural outputs.
+- Baseline solver comparison using scan, bracket, bisection, and post-check.
+- K-sweep evaluation and operating-point analysis.
+- Failure analysis by function family and template type.
+
+## Main Results Summary
+
+The paper evaluates the framework on a benchmark of 10,000 test equations spanning 12 nonlinear function families.
+
+Main findings:
+
+| Component               | Summary                                                                                        |
+| ----------------------- | ---------------------------------------------------------------------------------------------- |
+| Taylor truncation order | 25th-order local Taylor expansion provides a stable runtime-performance trade-off              |
+| Interval candidates     | top-25 candidate intervals provide a stable operating point                                    |
+| Validation threshold    | strict residual threshold of `1e-10` is used                                                   |
+| Residual quality        | validated roots reach residuals on the order of `1e-12` to `1e-11`                             |
+| Main limitation         | failure cases are often governed by representation-level limits of truncated Taylor expansions |
+
+## Repository Structure
+
+```text
+taylor-root-prediction/
+│
+├── README.md
+├── LICENSE
+├── requirements.txt
+├── .gitignore
+│
+├── configs/
+│   ├── taylor_root_ann.yaml
+│   ├── taylor_root_lstm.yaml
+│   ├── taylor_root_mlp.yaml
+│   ├── transformer_interval.yaml
+│   └── eval_k_sweep.yaml
+│
+├── models/
+│   ├── taylor_nn/
+│   │   ├── ann.py
+│   │   ├── lstm.py
+│   │   └── mlp.py
+│   └── transformer/
+│       └── model.py
+│
+├── scripts/
+│   ├── data/
+│   │   ├── generate_dataset_physchem_v4.py
+│   │   └── generate_interval_dataset_physchem_v4.py
+│   └── eval/
+│       └── evaluate_k_sweep.py
+│
+├── notebooks/
+│   └── reviewer_demo_notebook_v3.ipynb
+│
+├── results/
+│   └── generated outputs
+│
+└── src/
+    └── utility modules
+```
+
+Note: The notebook is provided as a reviewer-friendly demo.
+The core implementation is organized as Python scripts and YAML configuration files under models/, scripts/, and configs/.
+
+## Quick Start
+
+1. Clone the Repository
+
+```text
+git clone https://github.com/jseongnam/taylor-root-prediction.git
+cd taylor-root-prediction
+```
+
+2. Create Environment
+
+Using requirements.txt:
+```text
 pip install -r requirements.txt
 ```
-Option B — minimal install
-```bash
+Minimal installation:
+```text
 pip install numpy torch tqdm pyyaml matplotlib pillow
-# optional (only if you enable symbolic solvers)
+```
+Optional packages:
+```text
 pip install sympy requests
 ```
+GPU is optional.
+If CUDA is unavailable, the scripts can run on CPU, although training and large-scale evaluation will be slower.
 
-GPU is optional. If CUDA is unavailable, everything runs on CPU (slower).
+## Reviewer Demo Notebook
 
-2. Recommended: Run the Jupyter Notebook Demo
-
-We provide a reviewer notebook that can:
-
-(optional) generate small NPZ datasets
-
-(optional) train models
-
-evaluate all models + baseline
-
-show plots and failure distributions
-
-Open:
-
+A reviewer-friendly notebook is provided:
+```text
 notebooks/reviewer_demo_notebook_v3.ipynb
+```
+The notebook can be used to:
 
-Run from top to bottom.
+- generate small NPZ datasets
+- train small-scale models
+- evaluate neural regressors and baseline solvers
+- visualize residual distributions
+- inspect failure cases
 
-3. Repository Structure
-configs/
-  taylor_root_ann.yaml
-  taylor_root_lstm.yaml
-  taylor_root_mlp.yaml
-  transformer_interval.yaml
-  eval_k_sweep.yaml
+Open the notebook and run from top to bottom.
 
-models/
-  taylor_nn/
-    ann.py
-    lstm.py
-    mlp.py
-  transformer/
-    model.py
+## Dataset Generation
 
-scripts/
-  data/
-    generate_dataset_physchem_v4.py
-    generate_interval_dataset_physchem_v4.py
-  eval/
-    evaluate_k_sweep.py
-data/                       # (generated; not included by default)
-  taylor_data_physchem_v4_deg25/
-    taylor_deg25_{train,val,test}.npz
-  taylor_data_physchem_v4_interval/
-    taylor_deg25_{train,val,test}.npz
-  
-results/                    # outputs (generated)
+Large-scale datasets are not included in this repository due to file size limitations.
+Use the provided generation scripts to create NPZ files under data/.
 
-4. Dataset Generation (NPZ)
-
-The repository does not ship large datasets by default.
-Use the generation scripts to create NPZ files under data/.
-
-A) Root regression dataset (ANN/LSTM/MLP)
-
+A. Root Regression Dataset
 Expected outputs:
+```text
+data/taylor_data_physchem_v4_deg25/
+├── taylor_deg25_train.npz
+├── taylor_deg25_val.npz
+└── taylor_deg25_test.npz
+```
 
-data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz
+Run:
 
-data/taylor_data_physchem_v4_deg25/taylor_deg25_val.npz
-
-data/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz
-
-Run (example):
-```bash
+```text
 python scripts/data/generate_dataset_physchem_v4.py \
   --degree 25 \
   --n-total 20000 \
@@ -100,18 +229,27 @@ python scripts/data/generate_dataset_physchem_v4.py \
   --out-dir data/taylor_data_physchem_v4_deg25 \
   --save-expr-str 1
 ```
-B) Transformer interval dataset
 
+For large-scale experiments, increase --n-total.
+Example:
+```text
+python scripts/data/generate_dataset_physchem_v4.py \
+  --degree 25 \
+  --n-total 1000000 \
+  --seed 42 \
+  --out-dir data/taylor_data_physchem_v4_deg25 \
+  --save-expr-str 1
+```
+B. Transformer Interval Dataset
 Expected outputs:
-
-data/taylor_data_physchem_v4_interval/taylor_deg25_train.npz
-
-data/taylor_data_physchem_v4_interval/taylor_deg25_val.npz
-
-data/taylor_data_physchem_v4_interval/taylor_deg25_test.npz
-
-Run (example):
-```bash
+```text
+data/taylor_data_physchem_v4_interval/
+├── taylor_deg25_train.npz
+├── taylor_deg25_val.npz
+└── taylor_deg25_test.npz
+```
+Run:
+```text
 python scripts/data/generate_interval_dataset_physchem_v4.py \
   --degree 25 \
   --n-total 20000 \
@@ -119,27 +257,29 @@ python scripts/data/generate_interval_dataset_physchem_v4.py \
   --out-dir data/taylor_data_physchem_v4_interval \
   --save-expr-str 1
 ```
-
 Notes:
 
-Generation scripts can be expensive if n-total is large (e.g., 1,000,000).
+- Dataset generation can be expensive for large n-total.
+- For a quick sanity check, start with 20k to 100k.
+- For paper-scale experiments, use the full setting described in the manuscript.
 
-For reviewer testing, we recommend starting with small sizes (20k–100k).
+## Training
 
-5. Training (YAML-driven, no CLI args required)
+All training scripts are configured through YAML files and environment variables.
 
-All training scripts read:
+Common environment variables:
 
-config yaml via TAYLOR_CFG
-
-dataset paths via TRAIN_NPZ, VAL_NPZ, TEST_NPZ
-
-output directory via OUT_DIR
-
-device via DEVICE
+```text
+TAYLOR_CFG  : path to YAML configuration file
+TRAIN_NPZ   : training NPZ path
+VAL_NPZ     : validation NPZ path
+TEST_NPZ    : test NPZ path
+OUT_DIR     : output directory
+DEVICE      : cuda or cpu
+```
 
 ANN
-```bash
+```text
 PYTHONPATH=. \
 TAYLOR_CFG=configs/taylor_root_ann.yaml \
 TRAIN_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz \
@@ -149,8 +289,22 @@ OUT_DIR=results/taylor_nn/ann \
 DEVICE=cuda \
 python models/taylor_nn/ann.py
 ```
+
+CPU version:
+
+```text
+PYTHONPATH=. \
+TAYLOR_CFG=configs/taylor_root_ann.yaml \
+TRAIN_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz \
+VAL_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_val.npz \
+TEST_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz \
+OUT_DIR=results/taylor_nn/ann_cpu \
+DEVICE=cpu \
+python models/taylor_nn/ann.py
+```
+
 LSTM
-```bash
+```text
 PYTHONPATH=. \
 TAYLOR_CFG=configs/taylor_root_lstm.yaml \
 TRAIN_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz \
@@ -160,8 +314,9 @@ OUT_DIR=results/taylor_nn/lstm \
 DEVICE=cuda \
 python models/taylor_nn/lstm.py
 ```
-Anchored MLP
-```bash
+
+MLP / Anchored MLP
+```text
 PYTHONPATH=. \
 TAYLOR_CFG=configs/taylor_root_mlp.yaml \
 TRAIN_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz \
@@ -171,76 +326,182 @@ OUT_DIR=results/taylor_nn/mlp \
 DEVICE=cuda \
 python models/taylor_nn/mlp.py
 ```
-Transformer interval predictor
-```bash
-PYTHONPATH=. \
-CFG_PATH=configs/transformer_interval.yaml \
-TRAIN_NPZ=data/taylor_data_physchem_v4_interval/taylor_deg25_train.npz \
-VAL_NPZ=data/taylor_data_physchem_v4_interval/taylor_deg25_val.npz \
-TEST_NPZ=data/taylor_data_physchem_v4_interval/taylor_deg25_test.npz \
-OUT_DIR=results/transformer_interval \
-DEVICE=cuda \
-MODE=train \
-python models/transformer/model.py
-```
-6. Evaluation (K-sweep + Baseline + Plots + Failure Distribution)
 
-Evaluation is YAML-driven. Configure configs/eval_k_sweep.yaml and run:
-```bash
+## Evaluation
+
+The main evaluation script performs K-sweep analysis, baseline comparison, neural model comparison, and residual validation.
+
+Example:
+
+```text
 PYTHONPATH=. \
 EVAL_CFG=configs/eval_k_sweep.yaml \
-OUTDIR=results/runs_k_sweep_viz \
+OUTDIR=results/runs_k_sweep \
 DEVICE=cuda \
-python evaluation/evaluate_k_sweep.py
+python scripts/eval/evaluate_k_sweep.py
 ```
-Recommended flags via YAML (reviewer-friendly)
 
-threshold sweep
+CPU version:
 
-winner analysis
+```
+PYTHONPATH=. \
+EVAL_CFG=configs/eval_k_sweep.yaml \
+OUTDIR=results/runs_k_sweep_cpu \
+DEVICE=cpu \
+python scripts/eval/evaluate_k_sweep.py
+```
 
-fail concentration by func_id
+Evaluation outputs may include:
 
-residual histogram
+```text
+results/
+├── runs_k_sweep/
+│   ├── summary.csv
+│   ├── residual_statistics.csv
+│   ├── success_by_function_family.csv
+│   ├── failure_cases.csv
+│   └── plots/
+```
 
-func_id boxplot
+## Reproducing the Main Paper Results
 
-The evaluation script generates:
+The full paper-scale experiment may require large datasets and trained checkpoints.
 
-summary logs
+Recommended reproduction order:
 
-*.png plots (histograms, boxplots, edge cases)
+```text
+1. Generate root-regression dataset
+2. Generate interval-localization dataset
+3. Train Taylor-root regressors
+4. Train or load Transformer interval predictor
+5. Run K-sweep evaluation
+6. Run baseline solver comparison
+7. Analyze residual and failure distributions
+```
 
-fail_by_funcid_*.csv/json if enabled
+Suggested command flow:
 
-7. Reproducing “Failure concentration” (functions that all methods fail)
+```text
+# 1. Generate root-regression dataset
+python scripts/data/generate_dataset_physchem_v4.py \
+  --degree 25 \
+  --n-total 1000000 \
+  --seed 42 \
+  --out-dir data/taylor_data_physchem_v4_deg25 \
+  --save-expr-str 1
 
-In configs/eval_k_sweep.yaml:
+# 2. Generate interval dataset
+python scripts/data/generate_interval_dataset_physchem_v4.py \
+  --degree 25 \
+  --n-total 1000000 \
+  --seed 42 \
+  --out-dir data/taylor_data_physchem_v4_interval \
+  --save-expr-str 1
 
-reports.report_fail_funcid: true
+# 3. Train ANN
+PYTHONPATH=. \
+TAYLOR_CFG=configs/taylor_root_ann.yaml \
+TRAIN_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_train.npz \
+VAL_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_val.npz \
+TEST_NPZ=data/taylor_data_physchem_v4_deg25/taylor_deg25_test.npz \
+OUT_DIR=results/taylor_nn/ann \
+DEVICE=cuda \
+python models/taylor_nn/ann.py
 
-reports.report_fail_mode: baseline or all
+# 4. Run evaluation
+PYTHONPATH=. \
+EVAL_CFG=configs/eval_k_sweep.yaml \
+OUTDIR=results/runs_k_sweep \
+DEVICE=cuda \
+python scripts/eval/evaluate_k_sweep.py
+```
 
-baseline: where baseline fails (ok@thr) per func_id
+## Data and Checkpoints
 
-all: where all methods fail (winner_ok == none)
+Large datasets and model checkpoints are not included by default.
 
-Outputs:
+Recommended local structure:
 
-results/.../fail_by_funcid_{baseline|all}_K*_thr*.csv/json
+```text
+data/
+├── taylor_data_physchem_v4_deg25/
+│   ├── taylor_deg25_train.npz
+│   ├── taylor_deg25_val.npz
+│   └── taylor_deg25_test.npz
+│
+└── taylor_data_physchem_v4_interval/
+    ├── taylor_deg25_train.npz
+    ├── taylor_deg25_val.npz
+    └── taylor_deg25_test.npz
+```
 
-8. Notes for Reviewers
+Recommended checkpoint structure:
 
-All experiments can run on CPU, but training is slower.
+```text
+checkpoints/
+├── interval_transformer_best.pt
+├── root_regressor_ann_deg25.pt
+├── root_regressor_lstm_deg25.pt
+└── root_regressor_mlp_deg25.pt
+```
+If you use your own dataset or checkpoints, update the YAML files under configs/.
 
-Large-scale datasets (n-total=1,000,000) may require substantial time and disk.
+## Failure Analysis
 
-For quick verification, start with smaller dataset sizes (e.g., 20k) and fewer epochs.
+The repository includes utilities and outputs for failure-case analysis.
 
-If you see No module named src, run with PYTHONPATH=. as in the examples above.
+Failure analysis focuses on cases where the truncated local Taylor representation is insufficient, including:
 
-9. Citation
+- nearby singularities
+- boundary-sensitive functions
+- steep exponential growth
+oscillatory mismatch
+- local approximation failure outside the effective convergence region
 
-If you use this code, please cite our paper:
+Representative failure montage files may be provided in:
 
-(Provide your IEEE Access citation here)
+```text
+results/figures/
+results/pdf/
+```
+
+## Related Research Direction
+
+This repository corresponds to our IEEE Access work on Taylor-based root prediction.
+
+A related follow-up research direction explores baseline-aware neural correction and Newton refinement for nonlinear pipe-flow equations. In that framework, neural models act as warm-start accelerators rather than solver replacements. The corrected initializer is refined by Newton iteration to preserve final numerical accuracy.
+
+Together, these works follow the same research principle:
+
+```text
+Neural models should improve numerical initialization, prediction, or correction, while classical residual validation or Newton refinement preserves numerical reliability.
+```
+
+## Citation
+
+If you use this repository or find it useful for your research, please cite:
+
+```text
+@article{jeong2026root,
+  author  = {Seokjun Jeong and Yoosoo Oh},
+  title   = {A Root Prediction System for Single-Variable Equations with Existing Taylor Polynomials},
+  journal = {IEEE Access},
+  year    = {2026},
+  doi     = {10.1109/ACCESS.2026.3697368}
+}
+```
+
+## License
+
+This project is released under the MIT License.
+See:
+
+```text
+LICENSE
+```
+
+## Contact
+
+Seokjun Jeong
+Email: wjdtjrwns1109@gmail.com
+GitHub: jseongnam

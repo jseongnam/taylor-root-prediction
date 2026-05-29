@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this repository, please cite the following paper."
+title: "A Root Prediction System for Single-Variable Equations with Existing Taylor Polynomials"
+type: software
+authors:
+  - family-names: Jeong
+    given-names: Seokjun
+  - family-names: Oh
+    given-names: Yoosoo
+doi: 10.1109/ACCESS.2026.3697368
+year: 2026
+repository-code: "https://github.com/jseongnam/taylor-root-prediction"
+license: MIT
