@@ -455,7 +455,7 @@ Failure analysis focuses on cases where the truncated local Taylor representatio
 - nearby singularities
 - boundary-sensitive functions
 - steep exponential growth
-oscillatory mismatch
+- oscillatory mismatch
 - local approximation failure outside the effective convergence region
 
 Representative failure montage files may be provided in:
@@ -503,5 +503,7 @@ LICENSE
 ## Contact
 
 Seokjun Jeong
+
 Email: wjdtjrwns1109@gmail.com
+
 GitHub: jseongnam

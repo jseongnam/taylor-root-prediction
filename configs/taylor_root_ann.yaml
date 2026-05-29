@@ -1,11 +1,11 @@
 model:
   type: taylor_root_regressor
-  backbone: lstm
+  backbone: ann
   input:
     feature: taylor_coefficients
-    order: 15
+    order: 25
   output:
-    num_roots: 15
+    num_roots: 25
 architecture:
   hidden_dim: 25
   layers: auto
